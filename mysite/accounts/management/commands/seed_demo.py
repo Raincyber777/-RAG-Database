@@ -6,7 +6,7 @@
 from django.core.management.base import BaseCommand
 
 from accounts.models import User
-from faq.models import Faq
+from faq.models import Faq, Tip
 from feedback.models import Feedback
 from notes.models import Note
 from qa.models import QaRecord
@@ -47,6 +47,27 @@ FAQS = [
      '不会。停用仅禁止登录，账号名下的纪要、问答、题库数据全部保留；恢复后一切如常。删除类操作（如删除课堂纪要）才不可恢复，需谨慎确认。'),
     ('admin', '数据看板上的数字是真实的吗？',
      '当前为演示环境，看板指标、热门追问词与最新动态均来自前端演示数据：热门追问词实时统计自问答记录文本，最新动态每 3.5 秒轮播一次。接入后端后由统计接口提供。'),
+    # home：用户端首页（着陆页）的常见问题
+    ('home', '纪要里的「录音 03:24」是怎么来的？',
+     '语音转写模型会为每句话打上时间戳，纪要生成时把结论与其出处对齐，因此每个知识点都能定位到录音的精确时间点，点开角标即可核对原文。'),
+    ('home', '视频太大，浏览器会卡吗？',
+     '视频在浏览器端通过 ffmpeg.wasm 抽帧，只把关键帧和音轨送往后端，传输量远小于原视频。建议单个视频不超过 20 分钟；过长可先剪辑或只上传录音。'),
+    ('home', '我的课堂数据安全吗？',
+     '录音、图片与纪要仅存储在你的课堂知识库中，不会参与任何模型训练；只有你本人能看到自己的课堂内容，可随时删除。'),
+]
+
+TIPS = [
+    # (scope, 技巧内容) —— 与两端「使用说明」页的使用技巧一致
+    ('user', '答案中的 [1][2] 是引用角标，点开“引用来源”可核对录音原文或板书原图，不怕 AI 编造'),
+    ('user', '纪要里的「录音 03:24」角标点开可查看该时间点的转写原文，复习时精准回听'),
+    ('user', '智能问答输入框支持语音提问与附件上传（图片 / PPT / 文档）；Enter 发送、Shift+Enter 换行'),
+    ('user', '视频材料会自动抽帧并去重，只保留信息量最大的关键帧，无需手动截屏或调参'),
+    ('user', '练习中做错的题会自动收进错题本，点开错题卡片可回看完整题目与解析，按章节重练巩固薄弱点'),
+    ('admin', '演示环境下手机号 / 邮箱验证码统一为 123456；重置密码至少 8 位。'),
+    ('admin', '停用账号只禁止登录、不删除数据，随时可以恢复；操作前会弹出二次确认。'),
+    ('admin', '管理员账号两端通用：在用户端登录会先进入管理端，工作台可一键回到用户端。'),
+    ('admin', '用户名修改后，欢迎语的称呼、侧边栏卡片会同步更新（重新登录同样生效）。'),
+    ('admin', '看板图表与动态为演示数据，接入后端后替换为统计接口即可，页面结构不变。'),
 ]
 
 NOTES = [
@@ -86,7 +107,7 @@ FEEDBACKS = [
 
 
 class Command(BaseCommand):
-    help = '写入演示数据（账号 / FAQ / 纪要 / 问答 / 题库 / 反馈）'
+    help = '写入演示数据（账号 / FAQ / 使用技巧 / 纪要 / 问答 / 题库 / 反馈）'
 
     def add_arguments(self, parser):
         parser.add_argument('--force', action='store_true', help='已有数据时仍然重写（先清空）')
@@ -102,6 +123,7 @@ class Command(BaseCommand):
             Note.objects.all().delete()
             Feedback.objects.all().delete()
             Faq.objects.all().delete()
+            Tip.objects.all().delete()
             User.objects.all().delete()
 
         # ---- 账号 ----
@@ -116,6 +138,11 @@ class Command(BaseCommand):
         for order, (scope, q, a) in enumerate(FAQS):
             Faq.objects.create(scope=scope, q=q, a=a, order=order)
         self.stdout.write(f'FAQ x{len(FAQS)}')
+
+        # ---- 使用技巧 ----
+        for order, (scope, text) in enumerate(TIPS):
+            Tip.objects.create(scope=scope, text=text, order=order)
+        self.stdout.write(f'使用技巧 x{len(TIPS)}')
 
         # ---- 纪要（挂在 林小智 名下） ----
         lin = User.objects.get(email='linxz@zhiyuan.ai')

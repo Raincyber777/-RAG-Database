@@ -1,7 +1,7 @@
-"""FAQ 序列化器"""
+"""FAQ / 使用技巧序列化器"""
 from rest_framework import serializers
 
-from .models import Faq
+from .models import Faq, Tip
 
 
 class FaqSerializer(serializers.ModelSerializer):
@@ -19,4 +19,16 @@ class FaqSerializer(serializers.ModelSerializer):
         value = (value or '').strip()
         if not value:
             raise serializers.ValidationError('请输入解决描述')
+        return value
+
+
+class TipSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tip
+        fields = ['id', 'scope', 'text', 'order', 'updated_at']
+
+    def validate_text(self, value):
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('请输入技巧内容')
         return value

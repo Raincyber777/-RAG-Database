@@ -3,6 +3,7 @@
 - 用户端：提交反馈（可附多张截图）/ 我的反馈列表
 - 管理端：全部反馈列表（?status=）+ 标记已处理
 """
+from django.core.files.storage import default_storage
 from rest_framework import status
 from rest_framework.generics import ListAPIView, ListCreateAPIView
 from rest_framework.permissions import IsAuthenticated
@@ -18,30 +19,33 @@ from .serializers import FeedbackCreateSerializer, FeedbackSerializer
 class FeedbackListCreateView(ListCreateAPIView):
     """GET /api/feedback/ —— 我提交的反馈；POST —— 提交新反馈（multipart，截图 images）"""
 
+    serializer_class = FeedbackSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         return Feedback.objects.filter(user=self.request.user)
 
-    def get_serializer_class(self):
-        return FeedbackCreateSerializer if self.request.method == 'POST' else FeedbackSerializer
-
-    def perform_create(self, serializer):
-        feedback = serializer.save(user=self.request.user)
-
-        # 截图：字段名 images，可多张；校验格式与大小后保存到 media/feedback/
-        saved = []
-        for file in self.request.FILES.getlist('images'):
+    def create(self, request, *args, **kwargs):
+        # 截图先校验再落库（字段名 images，可多张），避免校验失败留下半成品反馈
+        files = request.FILES.getlist('images')
+        for file in files:
             validate_image(file)
-            saved.append(feedback.images.field.storage.save(f'feedback/{file.name}', file))
-        if saved:
-            feedback.images = saved
-            feedback.save(update_fields=['images'])
+
+        serializer = FeedbackCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # 截图存到 media/feedback/，JSONField 里只存 media 相对路径
+        images = [default_storage.save(f'feedback/{f.name}', f) for f in files]
 
         # 联系方式为空时默认使用注册邮箱
-        if not feedback.contact:
-            feedback.contact = feedback.user.email
-            feedback.save(update_fields=['contact'])
+        contact = serializer.validated_data.get('contact') or request.user.email
+        feedback = serializer.save(user=request.user, images=images, contact=contact)
+
+        # 返回完整反馈对象（与文档一致，含 id / status / user_name）
+        return Response(
+            FeedbackSerializer(feedback, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class AdminFeedbackListView(ListAPIView):

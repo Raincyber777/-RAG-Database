@@ -6,10 +6,14 @@ from .models import QaRecord
 
 class QaRecordSerializer(serializers.ModelSerializer):
     note_title = serializers.CharField(source='note.title', read_only=True, default='')
+    # 提问者与所属课程（管理端巡检页展示用；纪要被删后课程为空）
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    course = serializers.CharField(source='note.course', read_only=True, default='')
 
     class Meta:
         model = QaRecord
-        fields = ['id', 'note', 'note_title', 'question', 'answer', 'references', 'liked', 'created_at']
+        fields = ['id', 'note', 'note_title', 'course', 'user_name', 'question', 'answer',
+                  'references', 'liked', 'created_at']
         read_only_fields = fields
 
 

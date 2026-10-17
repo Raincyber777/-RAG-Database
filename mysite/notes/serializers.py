@@ -6,16 +6,21 @@ from .models import Note
 
 class NoteSerializer(serializers.ModelSerializer):
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
+    # 该纪要名下的问答条数（用户端问答页会话角标用）
+    questions = serializers.SerializerMethodField()
 
     class Meta:
         model = Note
         fields = [
             'id', 'course', 'title', 'duration', 'status', 'uploader', 'uploader_name',
             'source', 'source_type', 'theme', 'points', 'definitions', 'emphasized',
-            'transcript', 'created_at', 'updated_at',
+            'transcript', 'questions', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'status', 'uploader', 'theme', 'points', 'definitions',
-                            'emphasized', 'transcript', 'created_at', 'updated_at']
+                            'emphasized', 'transcript', 'questions', 'created_at', 'updated_at']
+
+    def get_questions(self, obj) -> int:
+        return obj.qa_records.count()
 
 
 class NoteCreateSerializer(serializers.ModelSerializer):

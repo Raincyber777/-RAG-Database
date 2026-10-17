@@ -96,6 +96,40 @@ class NoteReprocessView(APIView):
         return Response(NoteSerializer(note).data)
 
 
+class CourseRenameView(APIView):
+    """POST /api/notes/course-rename/ —— 课程重命名（body: {from, to}，改到已有课程即合并）"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        old = (request.data.get('from') or '').strip()
+        new = (request.data.get('to') or '').strip()
+        if not old or not new:
+            return Response({'detail': '请提供原课程名与新课程名'}, status=status.HTTP_400_BAD_REQUEST)
+        if old == new:
+            return Response({'detail': '新名称与原名称相同'}, status=status.HTTP_400_BAD_REQUEST)
+        updated = Note.objects.filter(uploader=request.user, course=old).update(course=new)
+        return Response({'course': new, 'updated': updated})
+
+
+class CourseDeleteView(APIView):
+    """POST /api/notes/course-delete/ —— 删除课程及其名下全部纪要（body: {course}）"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        course = (request.data.get('course') or '').strip()
+        if not course:
+            return Response({'detail': '请提供课程名'}, status=status.HTTP_400_BAD_REQUEST)
+        notes = Note.objects.filter(uploader=request.user, course=course)
+        for n in notes:
+            if n.source:
+                n.source.delete(save=False)
+        deleted = notes.count()
+        notes.delete()  # 问答 / 练习 / 错题随外键级联删除
+        return Response({'course': course, 'deleted': deleted})
+
+
 class AdminNoteListView(ListAPIView):
     """GET /api/admin/notes/ —— 全部纪要巡检（?course=&search=）"""
 

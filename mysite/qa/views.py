@@ -86,13 +86,16 @@ class AskView(APIView):
 
 
 class QaListView(ListAPIView):
-    """GET /api/qa/ —— 我的问答历史（?search=）"""
+    """GET /api/qa/ —— 我的问答历史（?search=&note=，note 为纪要 id 时只取该课的追问）"""
 
     serializer_class = QaRecordSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         qs = QaRecord.objects.filter(user=self.request.user).select_related('note')
+        note_id = self.request.query_params.get('note')
+        if note_id:
+            qs = qs.filter(note_id=note_id)
         keyword = (self.request.query_params.get('search') or '').strip()
         if keyword:
             qs = qs.filter(question__icontains=keyword)

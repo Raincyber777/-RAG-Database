@@ -79,15 +79,14 @@ WSGI_APPLICATION = 'mysite.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-# 先在 PostgreSQL 中创建数据库（如 CREATE DATABASE rag_db ENCODING 'UTF8';）
-# 并把下面的 USER / PASSWORD 改成自己的，然后执行 python manage.py migrate
+# 本机 PostgreSQL 17（服务 postgresql-x64-17，端口 5432），数据库 rag_db 已创建
 
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'rag_db',        # TODO: 换成你创建的数据库名
-        'USER': 'postgres',      # TODO: 换成你的 PG 用户名
-        'PASSWORD': 'postgres',  # TODO: 换成你的 PG 密码
+        'NAME': 'rag_db',
+        'USER': 'postgres',
+        'PASSWORD': 'Txy20070707',
         'HOST': 'localhost',
         'PORT': '5432',
     }

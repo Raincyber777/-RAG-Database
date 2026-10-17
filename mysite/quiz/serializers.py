@@ -6,12 +6,15 @@ from .models import QuizItem, WrongRecord
 
 class QuizItemSerializer(serializers.ModelSerializer):
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
+    # 答案与解析：用户端练习页即时批改、管理端题库详情都直接使用
+    answer = serializers.CharField(read_only=True)
+    analysis = serializers.CharField(read_only=True, default='')
 
     class Meta:
         model = QuizItem
         fields = [
             'id', 'note', 'course', 'chapter', 'type', 'stem', 'options',
-            'uploader', 'uploader_name', 'created_at',
+            'answer', 'analysis', 'uploader', 'uploader_name', 'created_at',
         ]
         read_only_fields = fields
 

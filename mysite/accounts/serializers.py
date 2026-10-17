@@ -80,7 +80,15 @@ class RegisterSerializer(serializers.Serializer):
         return _check_email_unique(value)
 
     def create(self, validated_data):
-        return User.objects.create_user(role=User.Role.USER, **validated_data)
+        # create_user 签名为 (username, email, password, **extra)；表单里的 name 即 username
+        data = dict(validated_data)
+        return User.objects.create_user(
+            username=data.pop('name'),
+            email=data.pop('email'),
+            password=data.pop('password'),
+            role=User.Role.USER,
+            **data,
+        )
 
 
 class AdminCreateSerializer(serializers.Serializer):
@@ -103,7 +111,14 @@ class AdminCreateSerializer(serializers.Serializer):
         return _check_email_unique(value)
 
     def create(self, validated_data):
-        return User.objects.create_user(role=User.Role.ADMIN, **validated_data)
+        data = dict(validated_data)
+        return User.objects.create_user(
+            username=data.pop('name'),
+            email=data.pop('email'),
+            password=data.pop('password'),
+            role=User.Role.ADMIN,
+            **data,
+        )
 
 
 class ResetPasswordSerializer(serializers.Serializer):

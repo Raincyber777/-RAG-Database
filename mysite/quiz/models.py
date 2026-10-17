@@ -18,7 +18,7 @@ class QuizItem(models.Model):
 
     note = models.ForeignKey(
         'notes.Note', verbose_name='来源纪要',
-        on_delete=models.SET_NULL, related_name='quiz_items', blank=True, null=True,
+        on_delete=models.CASCADE, related_name='quiz_items',
     )
     course = models.CharField('所属课程', max_length=100, db_index=True)
     chapter = models.CharField('章节', max_length=100, blank=True, default='')

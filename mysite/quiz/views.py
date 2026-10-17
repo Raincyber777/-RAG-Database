@@ -129,6 +129,19 @@ class WrongListView(ListAPIView):
         return WrongRecord.objects.filter(user=self.request.user).select_related('quiz')
 
 
+class WrongDeleteView(APIView):
+    """DELETE /api/quiz/wrong/{id}/ —— 已掌握，从错题本移除"""
+
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, pk):
+        record = WrongRecord.objects.filter(pk=pk, user=request.user).first()
+        if record is None:
+            return Response({'detail': '记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+        record.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class AdminQuizListView(ListAPIView):
     """GET /api/admin/quiz/ —— 全部题目巡检（?course=&type=&search=）"""
 

@@ -91,8 +91,9 @@ class MeView(APIView):
     def patch(self, request):
         ser = ProfileSerializer(data=request.data, context={'request': request})
         ser.is_valid(raise_exception=True)
+        # 对外字段 name 对应模型的 username（模型无 name 字段，直接 setattr 会静默丢失）
         for field, value in ser.validated_data.items():
-            setattr(request.user, field, value)
+            setattr(request.user, 'username' if field == 'name' else field, value)
         request.user.save()
         return Response(UserSerializer(request.user).data)
 
