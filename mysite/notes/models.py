@@ -41,3 +41,28 @@ class Note(models.Model):
 
     def __str__(self):
         return f'{self.course} · {self.title}'
+
+
+class NoteChunk(models.Model):
+    """纪要检索片段（RAG 入库单元）：分块文本 + 向量化结果。
+    embedding 以 JSON 存 1024 维 float 列表——当前规模（每篇纪要几十~几百片段）
+    Python 余弦检索足够；数据量上来后平迁 pgvector（本字段换 VectorField，检索函数在 mysite/rag.py 一处替换）。
+    """
+    note = models.ForeignKey(
+        Note, verbose_name='所属纪要',
+        on_delete=models.CASCADE, related_name='chunks',
+    )
+    seq = models.IntegerField('片段序号', default=0)
+    text = models.TextField('片段文本')
+    ref = models.CharField('来源引用', max_length=100, blank=True, default='')  # 录音 / 板书 第3页 / 纪要定义…
+    embedding = models.JSONField('向量', default=list, blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'note_chunk'
+        verbose_name = '纪要检索片段'
+        verbose_name_plural = verbose_name
+        ordering = ['note_id', 'seq']
+
+    def __str__(self):
+        return f'{self.note.title} #{self.seq}: {self.text[:20]}'

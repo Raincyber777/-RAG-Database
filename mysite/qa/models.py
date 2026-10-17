@@ -20,6 +20,7 @@ class QaRecord(models.Model):
     question = models.TextField('问题')
     answer = models.TextField('回答')
     references = models.JSONField('引用来源', default=list, blank=True)  # [{label, time, note_title}]
+    followups = models.JSONField('追问建议', default=list, blank=True)  # [str] 回答下方可点击的追问
     liked = models.BooleanField('已点赞', default=False)
     created_at = models.DateTimeField('提问时间', auto_now_add=True)
 

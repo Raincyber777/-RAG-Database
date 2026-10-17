@@ -1,0 +1,3 @@
+# 本地私密配置（API key 等），任何情况下不提交
+local_settings.py
+__pycache__/

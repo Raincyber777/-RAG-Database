@@ -6,6 +6,8 @@ from . import views
 urlpatterns = [
     path('qa/', views.QaListView.as_view()),
     path('qa/ask/', views.AskView.as_view()),
+    path('qa/ask/stream/', views.AskStreamView.as_view()),
+    path('qa/suggestions/', views.SuggestionsView.as_view()),
     path('qa/<int:pk>/like/', views.QaLikeView.as_view()),
     path('admin/qa/', views.AdminQaListView.as_view()),
 ]

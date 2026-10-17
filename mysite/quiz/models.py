@@ -1,7 +1,8 @@
 """
 题库模型：基于纪要自动出题（也可由管理端导入），作答后即时批改；
 错题自动进入错题本，答对后移出。与用户端「自创题练习」对应。
-TODO：接入 LLM 后按纪要内容批量生成高质量题目（当前 generate_stub 为占位实现）。
+出题由 LLM 按纪要片段生成（见 quiz.views.QuizGenerateView），题目带难度、
+来源引用（可对齐到录音时间点）与知识点标签，供前端筛选与溯源展示。
 """
 from django.conf import settings
 from django.db import models
@@ -23,10 +24,16 @@ class QuizItem(models.Model):
     course = models.CharField('所属课程', max_length=100, db_index=True)
     chapter = models.CharField('章节', max_length=100, blank=True, default='')
     type = models.CharField('题型', max_length=12, choices=Type.choices)
+    difficulty = models.CharField(
+        '难度', max_length=10, blank=True, default='中等',
+        choices=[('简单', '简单'), ('中等', '中等'), ('困难', '困难')],
+    )
     stem = models.TextField('题干')
     options = models.JSONField('选项', default=list, blank=True)  # ['A. ...', ...]
     answer = models.TextField('参考答案')
     analysis = models.TextField('解析', blank=True, default='')
+    cite = models.CharField('来源引用', max_length=50, blank=True, default='')  # 如「录音 02:13」
+    knowledge = models.CharField('知识点标签', max_length=100, blank=True, default='')
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL, verbose_name='出题人',
         on_delete=models.CASCADE, related_name='quiz_items',

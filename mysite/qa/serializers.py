@@ -13,7 +13,7 @@ class QaRecordSerializer(serializers.ModelSerializer):
     class Meta:
         model = QaRecord
         fields = ['id', 'note', 'note_title', 'course', 'user_name', 'question', 'answer',
-                  'references', 'liked', 'created_at']
+                  'references', 'followups', 'liked', 'created_at']
         read_only_fields = fields
 
 

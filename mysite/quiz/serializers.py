@@ -13,8 +13,8 @@ class QuizItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = QuizItem
         fields = [
-            'id', 'note', 'course', 'chapter', 'type', 'stem', 'options',
-            'answer', 'analysis', 'uploader', 'uploader_name', 'created_at',
+            'id', 'note', 'course', 'chapter', 'type', 'difficulty', 'stem', 'options',
+            'answer', 'analysis', 'cite', 'knowledge', 'uploader', 'uploader_name', 'created_at',
         ]
         read_only_fields = fields
 
@@ -24,7 +24,8 @@ class QuizDetailSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = QuizItem
-        fields = ['id', 'course', 'chapter', 'type', 'stem', 'options', 'answer', 'analysis']
+        fields = ['id', 'course', 'chapter', 'type', 'difficulty', 'stem', 'options',
+                  'answer', 'analysis', 'cite', 'knowledge']
 
 
 class SubmitSerializer(serializers.Serializer):
