@@ -22,7 +22,7 @@ SECRET_KEY = 'django-insecure-%dyq5@_wkpi5lk7(3enmg!dbus&$8ia_4$4zvm2a08!5e$rw8t
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', '.ngrok-free.app', '.ngrok-free.dev']
 
 
 # ---------- 模型服务（阿里云百炼，OpenAI 兼容模式） ----------
@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'quiz',
     'feedback',
     'faq',
+    'announcements',
 ]
 
 MIDDLEWARE = [
@@ -179,6 +180,16 @@ CORS_ALLOWED_ORIGINS = [
     'http://localhost:5174',  # 管理端
     'http://127.0.0.1:5173',
     'http://127.0.0.1:5174',
+]
+
+# 演示/内网穿透期放开跨域（ngrok 临时域名每次重启都会变，白名单没法穷举）；
+# 鉴权走 JWT 请求头而非 Cookie，放开 CORS 风险可控；上生产改回白名单。
+CORS_ALLOW_ALL_ORIGINS = True
+
+# 允许通过 ngrok 域名访问 Django admin（/admin/dj/）时通过 CSRF 校验
+CSRF_TRUSTED_ORIGINS = [
+    'https://*.ngrok-free.app',
+    'https://*.ngrok-free.dev',
 ]
 
 # 上传上限：课堂材料 / 截图最大 100MB

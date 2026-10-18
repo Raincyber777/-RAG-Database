@@ -24,7 +24,7 @@ class Note(models.Model):
         on_delete=models.CASCADE, related_name='notes',
     )
     source = models.FileField('原始材料', upload_to='notes/sources/', blank=True, null=True)
-    source_type = models.CharField('材料类型', max_length=12, blank=True, default='')  # audio/video/ppt
+    source_type = models.CharField('材料类型', max_length=12, blank=True, default='')  # audio/video/image/doc/ppt
     theme = models.TextField('课程主题', blank=True, default='')
     points = models.JSONField('核心知识点', default=list, blank=True)      # [{text, ref}]
     definitions = models.JSONField('重要定义与公式', default=list, blank=True)  # [{term, text, ref}]

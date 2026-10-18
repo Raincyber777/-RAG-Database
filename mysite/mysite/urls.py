@@ -25,6 +25,7 @@ urlpatterns = [
     path('api/', include('quiz.urls')),
     path('api/', include('feedback.urls')),
     path('api/', include('faq.urls')),
+    path('api/', include('announcements.urls')),
     path('api/stats/summary/', StatsSummaryView.as_view()),
 ]
 

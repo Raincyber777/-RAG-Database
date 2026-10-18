@@ -60,8 +60,11 @@ class LoginView(APIView):
         user = User.objects.filter(
             Q(email=account.lower()) | Q(phone=account) | Q(username=account),
         ).first()
-        if user is None or not user.check_password(password):
-            return Response({'detail': '账号或密码不正确'}, status=status.HTTP_401_UNAUTHORIZED)
+        # 细分失败原因给前端展示；注意不要用 401——统一封装会把 401 当 token 过期处理
+        if user is None:
+            return Response({'detail': '该账号尚未注册，请先注册'}, status=status.HTTP_400_BAD_REQUEST)
+        if not user.check_password(password):
+            return Response({'detail': '密码错误，请重新输入'}, status=status.HTTP_400_BAD_REQUEST)
         if user.status == User.Status.DISABLED:
             return Response({'detail': '该账号已被停用，请联系管理员'}, status=status.HTTP_403_FORBIDDEN)
         return Response(_token_payload(user))
