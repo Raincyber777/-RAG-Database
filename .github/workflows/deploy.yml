@@ -75,6 +75,10 @@ jobs:
 
           $SSH "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
             set -e
+            # migrate 不经过 systemd，需手动加载运行环境（DB 账号密码等）
+            set -a
+            . /etc/rag-backend.env
+            set +a
             cd /opt/rag-backend
             tar -xzf /tmp/rag-backend.tar.gz -C /opt/rag-backend
             [ -d venv ] || python3 -m venv venv
