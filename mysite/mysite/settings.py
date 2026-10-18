@@ -38,6 +38,22 @@ except ImportError:
     pass
 
 
+# ---------- 注册验证码发送通道（邮箱 SMTP / 阿里云短信，见 accounts/verification.py） ----------
+# 邮箱：QQ/163 等个人邮箱的 SMTP 授权码（非登录密码），服务器通过 RAG_EMAIL_* 注入
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.environ.get('RAG_EMAIL_HOST', 'smtp.qq.com')
+EMAIL_PORT = int(os.environ.get('RAG_EMAIL_PORT', '465'))
+EMAIL_USE_SSL = os.environ.get('RAG_EMAIL_SSL', 'True') == 'True'
+EMAIL_HOST_USER = os.environ.get('RAG_EMAIL_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('RAG_EMAIL_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.environ.get('RAG_EMAIL_FROM', '')
+# 短信：阿里云 RAM 账号的 AK/SK + 已审核通过的签名与验证码模板
+RAG_SMS_ACCESS_KEY_ID = os.environ.get('RAG_SMS_ACCESS_KEY_ID', '')
+RAG_SMS_ACCESS_KEY_SECRET = os.environ.get('RAG_SMS_ACCESS_KEY_SECRET', '')
+RAG_SMS_SIGN_NAME = os.environ.get('RAG_SMS_SIGN_NAME', '')
+RAG_SMS_TEMPLATE_CODE = os.environ.get('RAG_SMS_TEMPLATE_CODE', '')
+
+
 # Application definition
 
 INSTALLED_APPS = [

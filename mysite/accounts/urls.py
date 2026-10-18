@@ -12,6 +12,9 @@ urlpatterns = [
     path('auth/logout/', views.LogoutView.as_view()),
     path('auth/me/', views.MeView.as_view()),
     path('auth/password/', views.ChangePasswordView.as_view()),
+    # 注册验证码：先查可用接收方式，再发码，最后带码注册
+    path('auth/code-channels/', views.CodeChannelsView.as_view()),
+    path('auth/code/send/', views.CodeSendView.as_view()),
 
     # 管理端账号管理
     path('admin/accounts/', views.AdminAccountListView.as_view()),

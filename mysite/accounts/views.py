@@ -1,9 +1,11 @@
 """
 账号接口：
-- 统一登录 / 注册 / 登出 / 个人资料 / 修改密码（两端共用）
+- 统一登录 / 注册（含验证码）/ 登出 / 个人资料 / 修改密码（两端共用）
 - 管理端账号管理：列表筛选 / 新建管理员 / 重置密码 / 停用恢复
 """
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.validators import validate_email as django_validate_email
 from django.db.models import Q
 from rest_framework import status
 from rest_framework.generics import ListAPIView
@@ -15,10 +17,15 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from mysite.utils import IsAdminRole, IsSuperRole
 
+from .models import VerificationCode
 from .serializers import (
     AdminCreateSerializer, ChangePasswordSerializer, ProfileSerializer,
     RegisterSerializer, ResetPasswordSerializer, UserSerializer,
 )
+from .verification import (
+    CODE_TTL_SECONDS, CodeSendError, ThrottledError, channel_ready, issue_code,
+)
+from .serializers import PHONE_RE
 
 User = get_user_model()
 
@@ -34,7 +41,7 @@ def _token_payload(user: User) -> dict:
 
 
 class RegisterView(APIView):
-    """POST /api/auth/register/ —— 注册普通用户（成功即登录，返回 token）"""
+    """POST /api/auth/register/ —— 注册普通用户（需验证码，成功即登录，返回 token）"""
 
     permission_classes = [AllowAny]
 
@@ -43,6 +50,65 @@ class RegisterView(APIView):
         ser.is_valid(raise_exception=True)
         user = ser.save()
         return Response(_token_payload(user), status=status.HTTP_201_CREATED)
+
+
+class CodeChannelsView(APIView):
+    """GET /api/auth/code-channels/ —— 哪些验证码接收方式已配置可用（前端据此隐藏未开通项）"""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        # 键名与发码接口的 channel 取值对齐：email=邮箱，phone=短信（发到手机号）
+        return Response({
+            'email': channel_ready(VerificationCode.Channel.EMAIL),
+            'phone': channel_ready(VerificationCode.Channel.PHONE),
+        })
+
+
+class CodeSendView(APIView):
+    """POST /api/auth/code/send/ —— 发送注册验证码（channel=email|phone，target=邮箱/手机号）"""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        channel = (request.data.get('channel') or '').strip()
+        target = (request.data.get('target') or '').strip()
+        if channel not in (VerificationCode.Channel.EMAIL, VerificationCode.Channel.PHONE):
+            return Response({'detail': '接收方式不合法'}, status=status.HTTP_400_BAD_REQUEST)
+        if channel == VerificationCode.Channel.EMAIL:
+            try:
+                django_validate_email(target)
+            except Exception:
+                return Response({'detail': '邮箱格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+            target = target.lower()
+            exists_tip = '该邮箱已注册，请直接登录'
+            user_filter = Q(email=target)
+        else:
+            if not PHONE_RE.match(target):
+                return Response({'detail': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+            exists_tip = '该手机号已注册，请直接登录'
+            user_filter = Q(phone=target)
+        # 已注册的目标不再发码，避免用户在注册页打转
+        if User.objects.filter(user_filter).exists():
+            return Response({'detail': exists_tip}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 服务器未配置该通道：明确报错；本地 DEBUG 则退化为控制台出码，方便联调
+        deliver = True
+        if not channel_ready(channel):
+            if not settings.DEBUG:
+                return Response({'detail': '验证码服务未配置，请联系管理员'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            deliver = False
+        try:
+            code = issue_code(channel, target, deliver=deliver)
+        except ThrottledError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        except CodeSendError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        data = {'detail': f'验证码已发送至{"邮箱" if channel == "email" else "手机号"}，请查收',
+                'expires_in': CODE_TTL_SECONDS}
+        if not deliver:  # 调试模式：验证码未真正发出，直接返回供本地自动化 / 联调使用
+            data['dev_code'] = code
+        return Response(data)
 
 
 class LoginView(APIView):

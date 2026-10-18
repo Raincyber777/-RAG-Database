@@ -14,5 +14,8 @@ python-docx==1.2.0
 python-pptx==1.0.2
 openpyxl==3.1.5
 
+# 注册验证码短信通道（阿里云 Dysmsapi；邮箱通道用 Django 内置 SMTP，无额外依赖）
+alibabacloud_dysmsapi20170525==4.6.0
+
 # 生产 WSGI 服务器
 gunicorn==23.0.0

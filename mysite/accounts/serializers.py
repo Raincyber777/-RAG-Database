@@ -6,6 +6,8 @@ import re
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from .verification import check_code
+
 User = get_user_model()
 
 PHONE_RE = re.compile(r'^1[3-9]\d{9}$')
@@ -61,12 +63,15 @@ def _check_email_unique(email: str, exclude_pk=None):
 
 
 class RegisterSerializer(serializers.Serializer):
-    """注册（用户端表单）：创建普通用户并直接登录"""
+    """注册（用户端表单）：创建普通用户并直接登录；需先获取并提交验证码"""
 
     name = serializers.CharField(min_length=2, max_length=20)
     phone = serializers.CharField(max_length=11)
     email = serializers.EmailField()
     password = serializers.CharField(min_length=6, write_only=True)
+    # 验证码与其接收通道：code_channel=email 时 code 必须与发到邮箱的验证码一致
+    code = serializers.CharField(min_length=6, max_length=6)
+    code_channel = serializers.ChoiceField(choices=['email', 'phone'])
 
     def validate_name(self, value):
         if User.objects.filter(username=value.strip()).exists():
@@ -79,16 +84,31 @@ class RegisterSerializer(serializers.Serializer):
     def validate_email(self, value):
         return _check_email_unique(value)
 
+    def validate_code(self, value):
+        return value.strip()
+
+    def validate(self, attrs):
+        # 验证码对哪个目标校验取决于接收通道（邮箱在 validate_email 已统一小写）
+        target = attrs['email'] if attrs['code_channel'] == 'email' else attrs['phone']
+        try:
+            check_code(attrs['code_channel'], target, attrs['code'])
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+        return attrs
+
     def create(self, validated_data):
         # create_user 签名为 (username, email, password, **extra)；表单里的 name 即 username
         data = dict(validated_data)
-        return User.objects.create_user(
+        channel = data.pop('code_channel')
+        data.pop('code')  # 校验已消费，不落库到用户表
+        user = User.objects.create_user(
             username=data.pop('name'),
             email=data.pop('email'),
             password=data.pop('password'),
             role=User.Role.USER,
             **data,
         )
+        return user
 
 
 class AdminCreateSerializer(serializers.Serializer):
