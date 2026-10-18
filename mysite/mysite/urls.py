@@ -36,4 +36,4 @@ if settings.DEBUG:
 else:
     from django.urls import re_path
     from django.views.static import serve as media_serve
-    urlpatterns += re_path(r'^media/(?P<path>.*)$', media_serve, {'document_root': settings.MEDIA_ROOT})
+    urlpatterns += [re_path(r'^media/(?P<path>.*)$', media_serve, {'document_root': settings.MEDIA_ROOT})]
