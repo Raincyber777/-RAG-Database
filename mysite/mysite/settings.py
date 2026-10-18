@@ -20,9 +20,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-%dyq5@_wkpi5lk7(3enmg!dbus&$8ia_4$4zvm2a08!5e$rw8t'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# 服务器部署通过环境变量 DJANGO_DEBUG=False 关闭（见 /etc/rag-backend.env）
+DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
 ALLOWED_HOSTS = ['localhost', '127.0.0.1', '.ngrok-free.app', '.ngrok-free.dev']
+# 服务器部署：RAG_ALLOWED_HOSTS 追加公网地址（逗号分隔），如 39.96.61.195
+ALLOWED_HOSTS += [h.strip() for h in os.environ.get('RAG_ALLOWED_HOSTS', '').split(',') if h.strip()]
 
 
 # ---------- 模型服务（阿里云百炼，OpenAI 兼容模式） ----------
@@ -93,14 +96,15 @@ WSGI_APPLICATION = 'mysite.wsgi.application'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 # 本机 PostgreSQL 17（服务 postgresql-x64-17，端口 5432），数据库 rag_db 已创建
 
+# 环境变量可覆盖（服务器部署注入专用账号密码），缺省值即本地开发配置
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'rag_db',
-        'USER': 'postgres',
-        'PASSWORD': 'Txy20070707',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'NAME': os.environ.get('RAG_DB_NAME', 'rag_db'),
+        'USER': os.environ.get('RAG_DB_USER', 'postgres'),
+        'PASSWORD': os.environ.get('RAG_DB_PASSWORD', 'Txy20070707'),
+        'HOST': os.environ.get('RAG_DB_HOST', 'localhost'),
+        'PORT': os.environ.get('RAG_DB_PORT', '5432'),
     }
 }
 
@@ -191,6 +195,8 @@ CSRF_TRUSTED_ORIGINS = [
     'https://*.ngrok-free.app',
     'https://*.ngrok-free.dev',
 ]
+# 服务器部署：RAG_CSRF_ORIGINS 追加前端地址（逗号分隔），如 http://39.96.61.195:8081,http://39.96.61.195:8082
+CSRF_TRUSTED_ORIGINS += [o.strip() for o in os.environ.get('RAG_CSRF_ORIGINS', '').split(',') if o.strip()]
 
 # 上传上限：课堂材料 / 截图最大 100MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024

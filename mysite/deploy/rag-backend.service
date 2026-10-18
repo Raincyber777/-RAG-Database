@@ -1,0 +1,18 @@
+# 智学纪要后端 systemd 服务
+# CI 每次部署自动覆盖到 /etc/systemd/system/rag-backend.service 并重启
+[Unit]
+Description=RAG backend (Django + gunicorn on 127.0.0.1:8080)
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/rag-backend
+# 数据库密码 / DashScope key / DEBUG 开关都在这个 env 文件里（root:600）
+EnvironmentFile=/etc/rag-backend.env
+# --threads 4：问答 SSE 流式与文件上传并发时不再互相卡死
+# --timeout 600：大文件上传 + LLM 长请求不被 worker 杀掉
+ExecStart=/opt/rag-backend/venv/bin/gunicorn mysite.wsgi:application --bind 127.0.0.1:8080 --workers 2 --threads 4 --timeout 600 --access-logfile /var/log/rag-backend-access.log --error-logfile /var/log/rag-backend-error.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

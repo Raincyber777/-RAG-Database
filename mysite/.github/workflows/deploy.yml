@@ -1,0 +1,91 @@
+# 后端自动部署：push 到 main / txy 后自动发布到阿里云 ECS（/opt/rag-backend，gunicorn + systemd）
+# 前置配置（仓库 Settings → Secrets and variables → Actions）：
+#   Secrets（DEPLOY_* 四个与前端仓库相同）：
+#     DEPLOY_HOST / DEPLOY_USER / DEPLOY_PORT / DEPLOY_SSH_KEY
+#   Secrets（本仓库专用）：
+#     DASHSCOPE_API_KEY  百炼 API Key（值同本地 mysite/local_settings.py 里的）
+#     RAG_DB_PASSWORD    服务器 PostgreSQL 中 rag_app 账号的密码（首次建库时自定）
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main, txy]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package source
+        run: >
+          tar -czf /tmp/backend.tar.gz
+          --exclude='.git' --exclude='__pycache__' --exclude='*.pyc'
+          --exclude='venv' --exclude='media' --exclude='mysite/local_settings.py'
+          -C . .
+
+      - name: Release to ECS
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          SSH_PORT: ${{ secrets.DEPLOY_PORT }}
+          DASHSCOPE_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DB_PASSWORD: ${{ secrets.RAG_DB_PASSWORD }}
+        run: |
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
+            echo "::error::未配置 secrets DEPLOY_HOST / DEPLOY_USER"
+            exit 1
+          fi
+          if [ -z "$DASHSCOPE_KEY" ] || [ -z "$DB_PASSWORD" ]; then
+            echo "::error::未配置 secrets DASHSCOPE_API_KEY / RAG_DB_PASSWORD"
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          PORT="${SSH_PORT:-22}"
+          SSH="ssh -p $PORT -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key"
+          SCP="scp -P $PORT -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key"
+
+          $SSH "$SSH_USER@$SSH_HOST" "mkdir -p /opt/rag-backend"
+          $SCP /tmp/backend.tar.gz "$SSH_USER@$SSH_HOST:/tmp/rag-backend.tar.gz"
+
+          # 服务器上的运行环境配置（每次部署刷新，改 GitHub Secret 即可轮换密钥）
+          umask 077
+          cat > /tmp/rag-backend.env <<EOF
+          DASHSCOPE_API_KEY=$DASHSCOPE_KEY
+          RAG_DB_USER=rag_app
+          RAG_DB_PASSWORD=$DB_PASSWORD
+          DJANGO_DEBUG=False
+          RAG_ALLOWED_HOSTS=39.96.61.195,localhost,127.0.0.1
+          RAG_CSRF_ORIGINS=http://39.96.61.195:8081,http://39.96.61.195:8082
+          EOF
+          $SCP /tmp/rag-backend.env "$SSH_USER@$SSH_HOST:/etc/rag-backend.env"
+          $SSH "$SSH_USER@$SSH_HOST" "chmod 600 /etc/rag-backend.env"
+          rm -f /tmp/rag-backend.env
+
+          $SSH "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+            set -e
+            cd /opt/rag-backend
+            tar -xzf /tmp/rag-backend.tar.gz -C /opt/rag-backend
+            [ -d venv ] || python3 -m venv venv
+            ./venv/bin/pip install -q --upgrade pip
+            ./venv/bin/pip install -q -r requirements.txt
+            ./venv/bin/python manage.py migrate --noinput
+            mkdir -p media
+            cp deploy/rag-backend.service /etc/systemd/system/rag-backend.service
+            systemctl daemon-reload
+            systemctl enable --now rag-backend.service >/dev/null 2>&1 || systemctl restart rag-backend.service
+            rm -f /tmp/rag-backend.tar.gz
+            systemctl is-active rag-backend.service
+          REMOTE
+          echo "发布完成：/opt/rag-backend（服务 rag-backend.service 已重启）"
+
+      - name: Clean up key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

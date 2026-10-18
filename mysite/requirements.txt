@@ -1,0 +1,18 @@
+# 智学纪要后端依赖（版本对齐本地开发环境；服务器部署用）
+Django==5.2.14
+djangorestframework==3.17.1
+djangorestframework-simplejwt==5.5.1
+django-cors-headers==4.9.0
+psycopg2-binary==2.9.13
+requests==2.34.2
+numpy==2.2.6
+
+# 文档解析（录音/视频外的上传材料）
+pillow==12.2.0
+pymupdf==1.28.2
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+
+# 生产 WSGI 服务器
+gunicorn==23.0.0

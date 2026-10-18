@@ -29,6 +29,11 @@ urlpatterns = [
     path('api/stats/summary/', StatsSummaryView.as_view()),
 ]
 
-# 开发环境：提供用户上传的媒体文件（头像 / 材料 / 截图）
+# 提供用户上传的媒体文件（头像 / 材料 / 截图）
+# DEBUG=True 用 static()；生产（DEBUG=False）显式挂 serve，保证 /media 始终可用
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+else:
+    from django.urls import re_path
+    from django.views.static import serve as media_serve
+    urlpatterns += re_path(r'^media/(?P<path>.*)$', media_serve, {'document_root': settings.MEDIA_ROOT})
