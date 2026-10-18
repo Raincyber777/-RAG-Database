@@ -44,14 +44,20 @@ class User(AbstractUser):
 
 
 class VerificationCode(models.Model):
-    """注册验证码：邮箱 / 短信二选一发送，同一目标重新发送时旧码作废"""
+    """验证码：注册 / 更换手机号 / 更换邮箱共用，按用途分开限流与消费，同一目标重发即作废旧码"""
 
     class Channel(models.TextChoices):
         EMAIL = 'email', '邮箱'
         PHONE = 'phone', '手机号'
 
+    class Purpose(models.TextChoices):
+        REGISTER = 'register', '注册'
+        CHANGE_PHONE = 'change_phone', '更换手机号'
+        CHANGE_EMAIL = 'change_email', '更换邮箱'
+
     channel = models.CharField('发送通道', max_length=10, choices=Channel.choices, db_index=True)
     target = models.CharField('接收目标（邮箱统一小写）', max_length=254)
+    purpose = models.CharField('用途', max_length=15, choices=Purpose.choices, default=Purpose.REGISTER)
     code = models.CharField('6 位验证码', max_length=6)
     attempts = models.PositiveSmallIntegerField('已错误尝试次数', default=0)
     used = models.BooleanField('已使用', default=False)
@@ -60,10 +66,10 @@ class VerificationCode(models.Model):
 
     class Meta:
         db_table = 'accounts_verification_code'
-        verbose_name = '注册验证码'
+        verbose_name = '验证码'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-        indexes = [models.Index(fields=['channel', 'target'])]
+        indexes = [models.Index(fields=['channel', 'target', 'purpose'])]
 
     def __str__(self):
         return f'{self.get_channel_display()} → {self.target}'

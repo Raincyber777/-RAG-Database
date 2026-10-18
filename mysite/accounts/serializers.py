@@ -179,3 +179,45 @@ class ProfileSerializer(serializers.Serializer):
 
     def validate_email(self, value):
         return _check_email_unique(value, exclude_pk=self.context['request'].user.pk)
+
+
+class _ChangeContactSerializer(serializers.Serializer):
+    """
+    更换手机号 / 邮箱的公共基类：验证码发往账号绑定邮箱（证明是本人操作）。
+    子类声明 contact 字段并在 validate_contact 里查占用。
+    """
+
+    code = serializers.CharField(min_length=6, max_length=6)
+
+    def validate_code(self, value):
+        return value.strip()
+
+    def validate(self, attrs):
+        target = (self.context['request'].user.email or '').strip().lower()
+        if not target:
+            raise serializers.ValidationError('当前账号未绑定邮箱，无法验证身份')
+        try:
+            check_code('email', target, attrs['code'], purpose=self.purpose)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+        return attrs
+
+
+class ChangePhoneSerializer(_ChangeContactSerializer):
+    """POST /api/auth/me/phone/ —— 更换手机号（验证码发到绑定邮箱）"""
+
+    purpose = 'change_phone'
+    phone = serializers.CharField(max_length=11)
+
+    def validate_phone(self, value):
+        return _check_phone_unique(value, exclude_pk=self.context['request'].user.pk)
+
+
+class ChangeEmailSerializer(_ChangeContactSerializer):
+    """POST /api/auth/me/email/ —— 更换邮箱（验证码发到原绑定邮箱）"""
+
+    purpose = 'change_email'
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return _check_email_unique(value, exclude_pk=self.context['request'].user.pk)

@@ -15,6 +15,9 @@ urlpatterns = [
     # 注册验证码：先查可用接收方式，再发码，最后带码注册
     path('auth/code-channels/', views.CodeChannelsView.as_view()),
     path('auth/code/send/', views.CodeSendView.as_view()),
+    # 更换手机号 / 邮箱（绑定邮箱收码验证身份）
+    path('auth/me/phone/', views.ChangePhoneView.as_view()),
+    path('auth/me/email/', views.ChangeEmailView.as_view()),
 
     # 管理端账号管理
     path('admin/accounts/', views.AdminAccountListView.as_view()),

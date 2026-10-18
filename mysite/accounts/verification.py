@@ -44,27 +44,31 @@ def channel_ready(channel: str) -> bool:
     return False
 
 
-def issue_code(channel: str, target: str, deliver: bool = True) -> str:
+def issue_code(channel: str, target: str, purpose: str = 'register', deliver: bool = True) -> str:
     """
     生成并保存验证码；deliver=True 时真正发送。违反限流抛 ThrottledError，
     通道故障抛 CodeSendError；成功返回验证码本身。
+    限流按 (通道, 目标, 用途) 维度：注册与改绑互不挤占冷却额度。
     """
-    # 冷却：同一 channel+target 60s 内只允许发一次
-    last = VerificationCode.objects.filter(channel=channel, target=target).first()
+    # 冷却：同一 channel+target+purpose 60s 内只允许发一次
+    last = VerificationCode.objects.filter(channel=channel, target=target, purpose=purpose).first()
     if last and (wait := RESEND_COOLDOWN - int((timezone.now() - last.created_at).total_seconds())) > 0:
         raise ThrottledError(f'发送太频繁，请 {wait} 秒后再试')
     # 每日上限：防止邮箱/短信额度被刷
     sent_24h = VerificationCode.objects.filter(
-        channel=channel, target=target, created_at__gte=timezone.now() - timedelta(hours=24),
+        channel=channel, target=target, purpose=purpose,
+        created_at__gte=timezone.now() - timedelta(hours=24),
     ).count()
     if sent_24h >= DAILY_LIMIT:
         raise ThrottledError('今日该账号的验证码发送次数已达上限，请 24 小时后再试')
 
     code = f'{secrets.randbelow(1_000_000):06d}'
     # 新码发出后旧码全部作废，始终只有最新一条可用
-    VerificationCode.objects.filter(channel=channel, target=target, used=False).update(used=True)
+    VerificationCode.objects.filter(
+        channel=channel, target=target, purpose=purpose, used=False,
+    ).update(used=True)
     VerificationCode.objects.create(
-        channel=channel, target=target, code=code,
+        channel=channel, target=target, purpose=purpose, code=code,
         expires_at=timezone.now() + timedelta(seconds=CODE_TTL_SECONDS),
     )
 
@@ -78,12 +82,12 @@ def issue_code(channel: str, target: str, deliver: bool = True) -> str:
     return code
 
 
-def check_code(channel: str, target: str, code: str) -> None:
+def check_code(channel: str, target: str, code: str, purpose: str = 'register') -> None:
     """校验并消费验证码；不匹配 / 过期 / 次数用尽均抛 ValueError（message 可直接展示）"""
     with transaction.atomic():
         vc = (
             VerificationCode.objects.select_for_update()
-            .filter(channel=channel, target=target, used=False)
+            .filter(channel=channel, target=target, purpose=purpose, used=False)
             .first()
         )
         if vc is None or vc.is_expired or vc.is_exhausted:

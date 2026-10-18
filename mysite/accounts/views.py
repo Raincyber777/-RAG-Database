@@ -19,8 +19,9 @@ from mysite.utils import IsAdminRole, IsSuperRole
 
 from .models import VerificationCode
 from .serializers import (
-    AdminCreateSerializer, ChangePasswordSerializer, ProfileSerializer,
-    RegisterSerializer, ResetPasswordSerializer, UserSerializer,
+    AdminCreateSerializer, ChangeEmailSerializer, ChangePasswordSerializer,
+    ChangePhoneSerializer, ProfileSerializer, RegisterSerializer,
+    ResetPasswordSerializer, UserSerializer,
 )
 from .verification import (
     CODE_TTL_SECONDS, CodeSendError, ThrottledError, channel_ready, issue_code,
@@ -66,31 +67,50 @@ class CodeChannelsView(APIView):
 
 
 class CodeSendView(APIView):
-    """POST /api/auth/code/send/ —— 发送注册验证码（channel=email|phone，target=邮箱/手机号）"""
+    """
+    POST /api/auth/code/send/ —— 发送验证码
+    purpose=register（默认）：channel=email|phone + target=目标，目标不能已被注册
+    purpose=change_phone|change_email：仅限已登录，验证码固定发往账号绑定邮箱
+    """
 
     permission_classes = [AllowAny]
 
     def post(self, request):
-        channel = (request.data.get('channel') or '').strip()
-        target = (request.data.get('target') or '').strip()
-        if channel not in (VerificationCode.Channel.EMAIL, VerificationCode.Channel.PHONE):
-            return Response({'detail': '接收方式不合法'}, status=status.HTTP_400_BAD_REQUEST)
-        if channel == VerificationCode.Channel.EMAIL:
-            try:
-                django_validate_email(target)
-            except Exception:
-                return Response({'detail': '邮箱格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
-            target = target.lower()
-            exists_tip = '该邮箱已注册，请直接登录'
-            user_filter = Q(email=target)
+        purpose = (request.data.get('purpose') or 'register').strip()
+        if purpose not in (VerificationCode.Purpose.REGISTER,
+                           VerificationCode.Purpose.CHANGE_PHONE,
+                           VerificationCode.Purpose.CHANGE_EMAIL):
+            return Response({'detail': '用途不合法'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if purpose == VerificationCode.Purpose.REGISTER:
+            channel = (request.data.get('channel') or '').strip()
+            target = (request.data.get('target') or '').strip()
+            if channel not in (VerificationCode.Channel.EMAIL, VerificationCode.Channel.PHONE):
+                return Response({'detail': '接收方式不合法'}, status=status.HTTP_400_BAD_REQUEST)
+            if channel == VerificationCode.Channel.EMAIL:
+                try:
+                    django_validate_email(target)
+                except Exception:
+                    return Response({'detail': '邮箱格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+                target = target.lower()
+                exists_tip = '该邮箱已注册，请直接登录'
+                user_filter = Q(email=target)
+            else:
+                if not PHONE_RE.match(target):
+                    return Response({'detail': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
+                exists_tip = '该手机号已注册，请直接登录'
+                user_filter = Q(phone=target)
+            # 已注册的目标不再发码，避免用户在注册页打转
+            if User.objects.filter(user_filter).exists():
+                return Response({'detail': exists_tip}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            if not PHONE_RE.match(target):
-                return Response({'detail': '手机号格式不正确'}, status=status.HTTP_400_BAD_REQUEST)
-            exists_tip = '该手机号已注册，请直接登录'
-            user_filter = Q(phone=target)
-        # 已注册的目标不再发码，避免用户在注册页打转
-        if User.objects.filter(user_filter).exists():
-            return Response({'detail': exists_tip}, status=status.HTTP_400_BAD_REQUEST)
+            # 换绑场景：发往当前登录账号的绑定邮箱（JWT 照常解析，permission 虽为 AllowAny）
+            if not request.user.is_authenticated:
+                return Response({'detail': '请先登录'}, status=status.HTTP_401_UNAUTHORIZED)
+            channel = VerificationCode.Channel.EMAIL
+            target = (request.user.email or '').strip().lower()
+            if not target:
+                return Response({'detail': '当前账号未绑定邮箱，无法验证身份'}, status=status.HTTP_400_BAD_REQUEST)
 
         # 服务器未配置该通道：明确报错；本地 DEBUG 则退化为控制台出码，方便联调
         deliver = True
@@ -99,7 +119,7 @@ class CodeSendView(APIView):
                 return Response({'detail': '验证码服务未配置，请联系管理员'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
             deliver = False
         try:
-            code = issue_code(channel, target, deliver=deliver)
+            code = issue_code(channel, target, purpose=purpose, deliver=deliver)
         except ThrottledError as exc:
             return Response({'detail': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
         except CodeSendError as exc:
@@ -109,6 +129,32 @@ class CodeSendView(APIView):
         if not deliver:  # 调试模式：验证码未真正发出，直接返回供本地自动化 / 联调使用
             data['dev_code'] = code
         return Response(data)
+
+
+class ChangePhoneView(APIView):
+    """POST /api/auth/me/phone/ —— 更换手机号（绑定邮箱收码验证身份后改绑）"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ser = ChangePhoneSerializer(data=request.data, context={'request': request})
+        ser.is_valid(raise_exception=True)
+        request.user.phone = ser.validated_data['phone']
+        request.user.save(update_fields=['phone'])
+        return Response(UserSerializer(request.user).data)
+
+
+class ChangeEmailView(APIView):
+    """POST /api/auth/me/email/ —— 更换邮箱（原绑定邮箱收码验证身份后改绑）"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ser = ChangeEmailSerializer(data=request.data, context={'request': request})
+        ser.is_valid(raise_exception=True)
+        request.user.email = ser.validated_data['email']
+        request.user.save(update_fields=['email'])
+        return Response(UserSerializer(request.user).data)
 
 
 class LoginView(APIView):
