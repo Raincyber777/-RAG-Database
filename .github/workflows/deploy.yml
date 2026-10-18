@@ -105,7 +105,10 @@ jobs:
             mkdir -p media
             cp deploy/rag-backend.service /etc/systemd/system/rag-backend.service
             systemctl daemon-reload
-            systemctl enable --now rag-backend.service >/dev/null 2>&1 || systemctl restart rag-backend.service
+            # enable 幂等（已启用时静默成功，不会重启进程），restart 必须无条件执行——
+            # 否则服务已在运行时新代码只落盘不生效（曾因此线上 404 新接口）
+            systemctl enable rag-backend.service >/dev/null 2>&1
+            systemctl restart rag-backend.service
             rm -f /tmp/rag-backend.tar.gz
             systemctl is-active rag-backend.service
           REMOTE
