@@ -1,6 +1,2 @@
-Django==5.2.14
-djangorestframework==3.17.1
-djangorestframework-simplejwt==5.5.1
-django-cors-headers==4.9.0
-psycopg2-binary==2.9.13
-Pillow==12.2.0
+# 完整依赖清单在 mysite/requirements.txt（部署打包用），此处透传保持单一来源
+-r mysite/requirements.txt

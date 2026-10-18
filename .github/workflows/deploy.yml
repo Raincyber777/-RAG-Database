@@ -1,4 +1,5 @@
 # 后端自动部署：push 到 main / txy 后自动发布到阿里云 ECS（/opt/rag-backend，gunicorn + systemd）
+# 注意：本文件必须放在【仓库根目录】的 .github/workflows/ 下（GitHub 只认根目录的工作流）
 # 前置配置（仓库 Settings → Secrets and variables → Actions）：
 #   Secrets（DEPLOY_* 四个与前端仓库相同）：
 #     DEPLOY_HOST / DEPLOY_USER / DEPLOY_PORT / DEPLOY_SSH_KEY
@@ -22,12 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Django 工程在仓库的 mysite/ 子目录里，打包其内容为 tar 根，
+      # 服务器上 /opt/rag-backend 直接受到 manage.py / requirements.txt
       - name: Package source
         run: >
           tar -czf /tmp/backend.tar.gz
-          --exclude='.git' --exclude='__pycache__' --exclude='*.pyc'
-          --exclude='venv' --exclude='media' --exclude='mysite/local_settings.py'
-          -C . .
+          --exclude='__pycache__' --exclude='*.pyc'
+          --exclude='venv' --exclude='media'
+          --exclude='local_settings.py'
+          -C mysite .
 
       - name: Release to ECS
         env:

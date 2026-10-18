@@ -6,7 +6,10 @@ venv/
 
 # Django
 db.sqlite3
-/media/
+media/
+
+# 私密配置（DashScope key 等）——绝不提交
+mysite/local_settings.py
 
 # IDE / OS
 .idea/
