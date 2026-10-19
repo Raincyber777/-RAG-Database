@@ -5,10 +5,15 @@ from .models import QaRecord
 
 
 class QaRecordSerializer(serializers.ModelSerializer):
+    # 通用问答（无纪要）note 为空：主键用 method 返回 note_id，标题 / 课程回退空串
+    note = serializers.SerializerMethodField()
     note_title = serializers.CharField(source='note.title', read_only=True, default='')
     # 提问者与所属课程（管理端巡检页展示用；纪要被删后课程为空）
     user_name = serializers.CharField(source='user.username', read_only=True)
     course = serializers.CharField(source='note.course', read_only=True, default='')
+
+    def get_note(self, obj):
+        return obj.note_id
 
     class Meta:
         model = QaRecord

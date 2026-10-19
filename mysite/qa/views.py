@@ -163,30 +163,36 @@ class AskView(APIView):
         data = ser.validated_data
 
         note = _resolve_ask_note(request, data.get('note_id'))
-        if note is None:
-            return Response(
-                {'detail': '请先在「课堂纪要」完成一节课的纪要生成后再提问'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        question = data['question']
 
-        # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
-        result = rag.answer_note(note, data['question'])
-        if result is not None:
-            answer, refs, followups = result
+        if note is None:
+            # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
+            result = rag.answer_general(question)
+            if result is not None:
+                answer, refs, followups = result
+            else:
+                answer, refs, followups = rag.no_general_answer(), [], []
         else:
-            answer, refs = demo_answer(note, data['question'])
-            followups = []
+            # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
+            result = rag.answer_note(note, question)
+            if result is not None:
+                answer, refs, followups = result
+            else:
+                answer, refs = demo_answer(note, question)
+                followups = []
         record = QaRecord.objects.create(
-            user=request.user, note=note, question=data['question'],
+            user=request.user, note=note, question=question,
             answer=answer, references=refs, followups=followups,
         )
         return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
 
 
-def _stream_followups(note: Note, question: str, answer: str) -> list[str]:
-    """流式回答完成后的追问建议：轻量模型依据问题与回答节选独立生成；失败返回空"""
+def _stream_followups(note: Note | None, question: str, answer: str) -> list[str]:
+    """流式回答完成后的追问建议：轻量模型依据问题与回答节选独立生成；失败返回空（通用问答无纪要上下文）"""
+    head = (f'学生刚在《{note.title}》（{note.course}）提问：「{question}」'
+            if note else f'学生刚提问：「{question}」')
     prompt = (
-        f'学生刚在《{note.title}》（{note.course}）提问：「{question}」，助教已作答（节选）：{answer[:400]}'
+        f'{head}，助教已作答（节选）：{answer[:400]}'
         '\n请给 3 条学生最可能接着问的追问，中文、每条不超过 16 字。'
         '只输出 JSON：{"followups": ["...", "...", "..."]}'
     )
@@ -216,17 +222,14 @@ class AskStreamView(APIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         note = _resolve_ask_note(request, data.get('note_id'))
-        if note is None:
-            return Response(
-                {'detail': '请先在「课堂纪要」完成一节课的纪要生成后再提问'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         question = data['question']
+        general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
 
         def sse():
             buf, refs = '', []
             try:
-                for ev in rag.answer_stream(note, question):
+                gen = rag.answer_stream_general(question) if general else rag.answer_stream(note, question)
+                for ev in gen:
                     if ev['type'] == 'delta':
                         buf += ev['text']
                         yield _sse('delta', {'text': ev['text']})
@@ -238,8 +241,12 @@ class AskStreamView(APIView):
             except Exception:
                 pass  # 流中断：以已生成内容收尾
             if not buf:
-                buf, refs = demo_answer(note, question)
-                yield _sse('delta', {'text': buf})
+                if general:
+                    buf = rag.no_general_answer()
+                    yield _sse('delta', {'text': buf})
+                else:
+                    buf, refs = demo_answer(note, question)
+                    yield _sse('delta', {'text': buf})
             record = QaRecord.objects.create(
                 user=request.user, note=note, question=question,
                 answer=buf, references=refs, followups=_stream_followups(note, question, buf),

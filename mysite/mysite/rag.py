@@ -218,6 +218,95 @@ _JSON_OUT = ('最后给出 3 条学生最可能接着问的追问（每条不超
              '只输出 JSON：{"answer": "...", "followups": ["...", "...", "..."]}')
 _TEXT_OUT = '直接输出回答正文，不要输出 JSON。'
 
+# 通用模式（提问目标不存在：账号还没有任何已完成纪要）：纯外部联网检索回答，
+# 课堂之外的问题也能答，来源同样经清洗审核与白名单校验
+_GENERAL_RULES = (
+    '你是「智学纪要」的课堂助教。学生的这个问题超出了课堂纪要的范围，'
+    '以下为经清洗审核的外部网络资料要点：'
+    '1）依据外部资料要点用中文分点作答（不要自己写开头说明）；'
+    '2）每条引用用 [E编号] 标注；凡依据外部资料作答的句子，'
+    '必须在句末注明「补充自外部知识」，一处都不能漏；'
+    '3）外部资料仍不足以回答的部分，明确写「暂时无法确认」，不要编造。'
+)
+
+
+def no_general_answer() -> str:
+    """通用模式下外部检索不可用 / 无可靠依据时的固定回答（明确说明，不编造）"""
+    return ('暂时无法确认：外部检索未获得可靠依据，暂时回答不了这个问题。'
+            '你可以换个问法再试，或先在「课堂纪要」上传课堂材料后针对课内内容提问。')
+
+
+def _general_user(question: str, findings: list[dict]) -> str:
+    """通用模式 user 消息：只有外部要点与问题（无纪要上下文）"""
+    return (f'外部资料要点（已清洗去重，来源真实可引用）：\n{_external_context(findings)}'
+            f'\n\n学生问题：{question}')
+
+
+def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
+    """通用问答（无纪要目标）：联网检索 → 清洗 → qwen-plus 生成外部知识回答（JSON：answer + followups）。
+    返回 (answer, refs, followups)；外部检索不可用 / 无可靠依据返回 None，由调用方用固定话术兜底。"""
+    try:
+        findings = _pick_findings(question)
+        if not findings:
+            return None
+        data = llm.chat_json(
+            [{'role': 'system', 'content': _system(_GENERAL_RULES, stream=False)},
+             {'role': 'user', 'content': _general_user(question, findings)}],
+            temperature=0.3,
+        )
+        if not isinstance(data, dict):
+            return None
+        answer = str(data.get('answer') or '').strip()
+        if not answer:
+            return None
+        answer = _mark_external(answer)
+        raw_followups = data.get('followups')
+        followups = ([str(x).strip() for x in raw_followups if isinstance(x, str) and x.strip()][:3]
+                     if isinstance(raw_followups, list) else [])
+        refs = _external_refs(findings)
+        answer += '\n\n—— 来源说明 ——\n' + _source_line(refs)
+        return answer, refs, followups
+    except Exception:
+        return None
+
+
+def answer_stream_general(question: str):
+    """通用问答流式版（无纪要目标）：外部检索 → 流式生成，事件与 answer_stream 一致；
+    外部检索不可用时 yield 固定话术后正常结束（不降级演示检索——通用模式没有纪要可检）。"""
+    try:
+        findings = _pick_findings(question)
+        if not findings:
+            text = no_general_answer()
+            yield {'type': 'delta', 'text': text}
+            yield {'type': 'end', 'refs': []}
+            return
+        stream = llm.chat_stream(
+            [{'role': 'system', 'content': _system(_GENERAL_RULES, stream=True)},
+             {'role': 'user', 'content': _general_user(question, findings)}],
+            temperature=0.3,
+        )
+        if stream is None:
+            yield {'type': 'error'}
+            return
+        buf = ''
+        for delta in stream:
+            buf += delta
+            yield {'type': 'delta', 'text': delta}
+        if not buf.strip():
+            yield {'type': 'error'}
+            return
+        if '[E' in buf and '补充自外部知识' not in buf:
+            note_line = '\n\n（以上标注 [E编号] 的内容均为补充自外部知识）'
+            buf += note_line
+            yield {'type': 'delta', 'text': note_line}
+        refs = _external_refs(findings)
+        tail = '\n\n—— 来源说明 ——\n' + _source_line(refs)
+        buf += tail
+        yield {'type': 'delta', 'text': tail}
+        yield {'type': 'end', 'refs': refs}
+    except Exception:
+        yield {'type': 'error'}
+
 
 def _system(rules: str, stream: bool) -> str:
     return rules + (_TEXT_OUT if stream else _JSON_OUT)

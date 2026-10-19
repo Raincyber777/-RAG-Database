@@ -16,6 +16,7 @@ class QaRecord(models.Model):
     note = models.ForeignKey(
         'notes.Note', verbose_name='关联纪要',
         on_delete=models.CASCADE, related_name='qa_records',
+        null=True, blank=True,  # 通用问答（账号尚无已完成纪要，纯外部检索回答）为空
     )
     question = models.TextField('问题')
     answer = models.TextField('回答')
