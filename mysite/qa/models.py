@@ -22,6 +22,8 @@ class QaRecord(models.Model):
     answer = models.TextField('回答')
     references = models.JSONField('引用来源', default=list, blank=True)  # [{label, time, note_title}]
     followups = models.JSONField('追问建议', default=list, blank=True)  # [str] 回答下方可点击的追问
+    # 前端自由对话的会话标识（'qa'+时间戳）：刷新后按会话拉回历史；课内追问走 note 关联，此字段留空
+    session_ref = models.CharField('前端会话标识', max_length=64, blank=True, default='', db_index=True)
     liked = models.BooleanField('已点赞', default=False)
     created_at = models.DateTimeField('提问时间', auto_now_add=True)
 

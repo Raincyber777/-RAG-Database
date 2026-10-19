@@ -18,15 +18,18 @@ class QaRecordSerializer(serializers.ModelSerializer):
     class Meta:
         model = QaRecord
         fields = ['id', 'note', 'note_title', 'course', 'user_name', 'question', 'answer',
-                  'references', 'followups', 'liked', 'created_at']
+                  'references', 'followups', 'liked', 'created_at', 'session_ref']
         read_only_fields = fields
 
 
 class AskSerializer(serializers.Serializer):
-    """提问参数：可指定纪要（不传则在最近一节纪要内检索）"""
+    """提问参数：可指定纪要（不传则在最近一节纪要内检索）；
+    session_ref 为前端自由对话的会话标识（'qa'+时间戳），用于刷新后按会话拉回历史。
+    """
 
     note_id = serializers.IntegerField(required=False, allow_null=True)
     question = serializers.CharField(max_length=1000, trim_whitespace=True)
+    session_ref = serializers.CharField(required=False, allow_blank=True, max_length=64)
 
     def validate_question(self, value):
         value = value.strip()

@@ -196,6 +196,7 @@ class AskView(APIView):
         record = QaRecord.objects.create(
             user=request.user, note=note, question=question,
             answer=answer, references=refs, followups=followups,
+            session_ref=data.get('session_ref', ''),
         )
         return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
 
@@ -263,6 +264,7 @@ class AskStreamView(APIView):
             record = QaRecord.objects.create(
                 user=request.user, note=note, question=question,
                 answer=buf, references=refs, followups=_stream_followups(note, question, buf),
+                session_ref=data.get('session_ref', ''),
             )
             yield _sse('done', QaRecordSerializer(record).data)
 
@@ -283,6 +285,10 @@ class QaListView(ListAPIView):
         note_id = self.request.query_params.get('note')
         if note_id:
             qs = qs.filter(note_id=note_id)
+        # 按前端自由对话会话拉历史（刷新后恢复会话消息）
+        session = (self.request.query_params.get('session') or '').strip()
+        if session:
+            qs = qs.filter(session_ref=session)
         keyword = (self.request.query_params.get('search') or '').strip()
         if keyword:
             qs = qs.filter(question__icontains=keyword)
