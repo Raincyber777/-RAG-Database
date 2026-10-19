@@ -14,7 +14,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
-from .views import StatsSummaryView
+from .views import DashboardFeedView, StatsSummaryView
 
 urlpatterns = [
     path('admin/dj/', admin.site.urls),  # Django 后台（调试用；业务管理端走 /api/admin/*）
@@ -27,6 +27,7 @@ urlpatterns = [
     path('api/', include('faq.urls')),
     path('api/', include('announcements.urls')),
     path('api/stats/summary/', StatsSummaryView.as_view()),
+    path('api/stats/dashboard/', DashboardFeedView.as_view()),
 ]
 
 # 提供用户上传的媒体文件（头像 / 材料 / 截图）

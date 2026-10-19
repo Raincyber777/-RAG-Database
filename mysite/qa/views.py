@@ -58,12 +58,17 @@ class SuggestionsView(APIView):
         if cached:
             return Response({'suggestions': cached})
         recent = list(QaRecord.objects.filter(user=user).select_related('note')[:6])
-        if recent:
-            items = _llm_suggestions(recent) or _rule_suggestions(recent)
+        # 通用问答记录（note 为空）不参与纪要向推荐，避免 None 崩溃
+        note_records = [r for r in recent if r.note_id]
+        if note_records:
+            items = _llm_suggestions(note_records) or _rule_suggestions(note_records)
+        elif recent:
+            # 只有过自由问答（账号无已完成纪要）：通用知识向推荐，走联网通用问答
+            items = list(GENERAL_SUGGESTIONS)
         else:
-            # 还没提过问：从最新纪要出推荐题 + 通用兜底
-            latest = list(Note.objects.filter(status=Note.Status.DONE).order_by('-created_at')[:2])
-            items = [f'《{n.title}》的重点是什么？' for n in latest] + DEFAULT_SUGGESTIONS[:2]
+            # 还没提过问：优先从本人最新纪要出推荐题；无纪要则全通用
+            latest = list(Note.objects.filter(uploader=user, status=Note.Status.DONE).order_by('-created_at')[:2])
+            items = [f'《{n.title}》的重点是什么？' for n in latest] + DEFAULT_SUGGESTIONS[:2] if latest else list(GENERAL_SUGGESTIONS)
         items = items[:4]
         # 缓存到「当天 / 未提新问题」，避免每次进页面都调模型
         latest_pk = QaRecord.objects.filter(user=user).values_list('pk', flat=True).first()
@@ -88,6 +93,14 @@ DEFAULT_SUGGESTIONS = [
     '泰勒展开有哪些易错点？',
     '进程和线程的区别是什么？',
     '二叉树的四种遍历怎么背？',
+]
+
+# 无纪要账号（未上传任何课堂资料）的通用推荐：不预设课堂内容，走联网通用问答
+GENERAL_SUGGESTIONS = [
+    '用通俗的话解释什么是机器学习',
+    '帮我制定高数期末复习计划',
+    '英语四级作文有哪些万能句型？',
+    '什么是毕达哥拉斯定理？',
 ]
 
 
