@@ -243,7 +243,7 @@ def _general_user(question: str, findings: list[dict]) -> str:
 
 
 def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
-    """通用问答（无纪要目标）：联网检索 → 清洗 → qwen-plus 生成外部知识回答（JSON：answer + followups）。
+    """通用问答（无纪要目标）：联网检索 → 清洗 → flash 生成外部知识回答（JSON：answer + followups）。
     返回 (answer, refs, followups)；外部检索不可用 / 无可靠依据返回 None，由调用方用固定话术兜底。"""
     try:
         findings = _pick_findings(question)
@@ -252,6 +252,7 @@ def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
         data = llm.chat_json(
             [{'role': 'system', 'content': _system(_GENERAL_RULES, stream=False)},
              {'role': 'user', 'content': _general_user(question, findings)}],
+            model=llm.MODEL_LITE,  # 通用回答由审核后的要点重组而来，flash 提速明显；课内问答仍走 qwen-plus
             temperature=0.3,
         )
         if not isinstance(data, dict):
@@ -283,6 +284,7 @@ def answer_stream_general(question: str):
         stream = llm.chat_stream(
             [{'role': 'system', 'content': _system(_GENERAL_RULES, stream=True)},
              {'role': 'user', 'content': _general_user(question, findings)}],
+            model=llm.MODEL_LITE,  # 通用回答由审核后的要点重组而来，flash 提速明显；课内问答仍走 qwen-plus
             temperature=0.3,
         )
         if stream is None:

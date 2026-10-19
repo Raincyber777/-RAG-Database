@@ -97,11 +97,14 @@ SEARCH_TIMEOUT = 60   # 联网搜索比普通对话慢（服务端先检索再�
 CONF_LABEL = {'high': '高', 'mid': '中', 'low': '低'}
 
 
-def search_answer(question: str, timeout: int = SEARCH_TIMEOUT) -> tuple[str, list[dict]] | None:
+def search_answer(question: str, timeout: int = SEARCH_TIMEOUT,
+                  model: str | None = None) -> tuple[str, list[dict]] | None:
     """联网搜索问答（原生 API enable_search 插件：服务端先检索再生成）。
     返回 (基于搜索结果的回答文本, 真实搜索结果清单 [{title, url, site_name}])；失败返回 None。
     走原生接口而非 compatible-mode：只有原生接口回传 search_info.search_results 真实来源清单，
     供后续步骤做来源白名单校验，防止模型编造链接。
+    默认用 MODEL_LITE：这份回答只是审核步骤的中间素材（不直接给用户），
+    生成环节用 qwen-plus 会把通用问答的首字等待拖慢 10s 以上。
     """
     if not available():
         return None
@@ -110,7 +113,7 @@ def search_answer(question: str, timeout: int = SEARCH_TIMEOUT) -> tuple[str, li
             SEARCH_URL,
             headers={'Authorization': f"Bearer {settings.DASHSCOPE_API_KEY}"},
             json={
-                'model': MODEL_CHAT,
+                'model': model or MODEL_LITE,
                 'input': {'messages': [
                     {'role': 'system', 'content': '基于搜索结果用中文简洁、准确地回答。'},
                     {'role': 'user', 'content': question},
@@ -164,6 +167,7 @@ def search_findings(question: str, timeout: int = SEARCH_TIMEOUT) -> list[dict] 
             )},
             {'role': 'user', 'content': f'学生问题：{question}\n\n搜索摘要：\n{text}\n\n候选来源清单：\n{listing}'},
         ],
+        model=MODEL_LITE,  # 清洗 / 去重 / 标注可信度是机械任务，flash 足够；qwen-plus 会拖慢首字
         temperature=0.2,
         timeout=timeout,
     )
