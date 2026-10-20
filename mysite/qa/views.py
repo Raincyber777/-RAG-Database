@@ -9,6 +9,7 @@ from django.http import StreamingHttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import ListAPIView
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -19,6 +20,7 @@ from notes.models import Note
 
 from .models import QaRecord
 from .serializers import AskSerializer, QaRecordSerializer
+from . import agent_bridge
 
 
 def _score(question: str, text: str) -> int:
@@ -157,12 +159,17 @@ def _llm_suggestions(recent: list[QaRecord]) -> list[str] | None:
 
 def _resolve_ask_note(request, note_id) -> Note | None:
     """提问目标纪要：显式指定时校验归属（本人或管理员），否则取本人最新已完成纪要"""
-    note = None
-    if note_id:
-        note = Note.objects.filter(pk=note_id).first()
-        if note and note.uploader_id != request.user.pk and not request.user.is_admin_role:
-            note = None
-    return note or Note.objects.filter(uploader=request.user, status=Note.Status.DONE).first()
+    if note_id is not None:
+        notes = Note.objects.filter(pk=note_id)
+        if not request.user.is_admin_role:
+            notes = notes.filter(uploader=request.user)
+        note = notes.first()
+        if note is None:
+            raise NotFound('纪要不存在或无权访问')
+        if note.status != Note.Status.DONE:
+            raise ValidationError({'detail': '请等待当前纪要处理完成后再提问'})
+        return note
+    return Note.objects.filter(uploader=request.user, status=Note.Status.DONE).first()
 
 
 class AskView(APIView):
@@ -178,7 +185,11 @@ class AskView(APIView):
         note = _resolve_ask_note(request, data.get('note_id'))
         question = data['question']
 
-        if note is None:
+        use_agent = agent_bridge.enabled()
+        if use_agent:
+            result = agent_bridge.answer(request.user, note, question)
+            answer, refs, followups = result['answer'], result['references'], result['followups']
+        elif note is None:
             # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
             result = rag.answer_general(question)
             if result is not None:
@@ -198,7 +209,9 @@ class AskView(APIView):
             answer=answer, references=refs, followups=followups,
             session_ref=data.get('session_ref', ''),
         )
-        return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
+        response = Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
+        response['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
+        return response
 
 
 def _stream_followups(note: Note | None, question: str, answer: str) -> list[str]:
@@ -224,9 +237,9 @@ def _sse(event: str, payload: dict) -> str:
 
 class AskStreamView(APIView):
     """POST /api/qa/ask/stream/ —— SSE 流式提问（text/event-stream）
-    事件流：delta（回答增量，逐段下发）→ done（完整问答记录，含引用与追问）。
-    真流式：向量召回后 qwen-plus 逐 token 生成；RAG 不可用时降级演示检索一次性下发；
-    流中断时以已生成内容收尾（无引用），保证前端总能拿到 done 记录入库。
+    Agent 事件：status / delta / replace → done（已入库的完整问答记录）。
+    replace 覆盖临时答案，只有最终答案入库；保留通用问答及 session_ref。
+    AGENT_ENABLED=0 或缺少包/模型 key 时沿用旧 RAG 路径。
     """
 
     permission_classes = [IsAuthenticated]
@@ -238,8 +251,22 @@ class AskStreamView(APIView):
         note = _resolve_ask_note(request, data.get('note_id'))
         question = data['question']
         general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
+        use_agent = agent_bridge.enabled()
 
         def sse():
+            if use_agent:
+                from contextlib import closing
+                with closing(agent_bridge.stream(request.user, note, question)) as events:
+                    for event in events:
+                        if event['event'] == 'done':
+                            record = QaRecord.objects.create(
+                                user=request.user, note=note, question=question,
+                                session_ref=data.get('session_ref', ''), **event['data'],
+                            )
+                            yield _sse('done', QaRecordSerializer(record).data)
+                            return
+                        yield _sse(event['event'], event['data'])
+                return
             buf, refs = '', []
             try:
                 gen = rag.answer_stream_general(question) if general else rag.answer_stream(note, question)
@@ -271,6 +298,7 @@ class AskStreamView(APIView):
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')
         resp['Cache-Control'] = 'no-cache'
         resp['X-Accel-Buffering'] = 'no'
+        resp['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
         return resp
 
 

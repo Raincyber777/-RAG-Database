@@ -27,7 +27,7 @@ class AskSerializer(serializers.Serializer):
     session_ref 为前端自由对话的会话标识（'qa'+时间戳），用于刷新后按会话拉回历史。
     """
 
-    note_id = serializers.IntegerField(required=False, allow_null=True)
+    note_id = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     question = serializers.CharField(max_length=1000, trim_whitespace=True)
     session_ref = serializers.CharField(required=False, allow_blank=True, max_length=64)
 

@@ -1,0 +1,3 @@
+# Run from the backend repository root with the same interpreter as manage.py.
+# The sibling checkout is the reviewed local package, not the unrelated PyPI name.
+-e ../agent
