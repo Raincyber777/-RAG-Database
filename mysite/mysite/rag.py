@@ -7,6 +7,8 @@ RAG 检索问答管线：纪要分块 → 向量化入库 → 余弦召回 → �
   KB_WEAK ~ KB_STRONG          → 知识库为主，外部搜索补充（标注「补充自外部知识」，冲突以纪要为准）
   < KB_WEAK / 无片段            → 外部检索主导；两边都没有可靠依据时明确「暂时无法确认」
   外部知识经 llm.search_findings 清洗 / 去重 / 可信度判断后进入融合，来源白名单防编造
+- 日常对话：寒暄 / 问身份 / 闲聊等无需事实依据的输入不进检索（检索也搜不到，只会误报
+  「无法确认」），由轻量模型直答（_chat_reply）；检索落空拒绝前再兜底判一次
 - 检索规模说明：每篇纪要几十~几百片段，Python 余弦毫秒级完成；后续数据量上来
   平迁 pgvector 时只需把 retrieve() 换成 VectorField + CosineDistance 查询
 - 降级约定：answer_note() 基础设施失败（key 未配置 / 向量化失败）返回 None，
@@ -236,6 +238,46 @@ def no_general_answer() -> str:
             '你可以换个问法再试，或先在「课堂纪要」上传课堂材料后针对课内内容提问。')
 
 
+# ---------- 日常对话直答：寒暄 / 问身份 / 闲聊等无需事实依据的输入，不进检索链路 ----------
+# 背景：外部检索对「你好」这类输入搜不到任何结果，若直接走拒绝话术会显得连基本对话都不会
+
+_CHAT_PAT = re.compile(
+    r'(你好|您好|嗨|哈喽|在吗|在么|谢谢|多谢|感谢|拜拜|再见|晚安|早安|早上好|中午好|下午好|晚上好'
+    r'|你是谁|你叫什么|你是机器人|你是真人|你是人吗|你能做什么|你会什么|自我介绍|讲个笑话'
+    r'|\b(?:hi|hello|thanks)\b)', re.I)
+
+
+def _looks_chitchat(question: str) -> bool:
+    """规则初判：短输入命中寒暄特征词、且不带真问题才算；宁漏勿错，漏网的走兜底二判"""
+    q = question.strip()
+    if not q or len(q) > 24 or not _CHAT_PAT.search(q):
+        return False
+    # 打招呼里夹带真问题（「你好，什么是勾股定理」）不按寒暄处理
+    return not re.search(r'[？?]|什么是|怎么|为什么|如何|讲讲|解释|总结|哪些|帮我|介绍下|介绍一下', q)
+
+
+_CHAT_RULES = (
+    '你是「智学纪要」的课堂助教（基于课堂纪要检索与联网资料的 AI 学习助手）。'
+    '判断学生这条输入是否属于日常对话——打招呼、感谢、道别、询问你的身份或功能、'
+    '闲聊、讲个笑话等不需要真实事实依据的输入：'
+    '1）是 → 用中文自然、简短、友好地回复，可顺带引导他提问学习问题，只输出 JSON：{"reply": "…"}；'
+    '2）否（需要事实或知识依据才能回答）→ 只输出 JSON：{"refuse": true}。'
+)
+
+
+def _chat_reply(question: str) -> str | None:
+    """日常对话直答：由轻量模型判定并回复；判定为需要事实依据的问题（或模型不可用）
+    返回 None，交回原检索 / 拒绝链路，守住「没有依据不编造」的底线。"""
+    data = llm.chat_json(
+        [{'role': 'system', 'content': _CHAT_RULES},
+         {'role': 'user', 'content': question}],
+        model=llm.MODEL_LITE, temperature=0.6,
+    )
+    if not isinstance(data, dict) or data.get('refuse'):
+        return None
+    return str(data.get('reply') or '').strip() or None
+
+
 def _general_user(question: str, findings: list[dict]) -> str:
     """通用模式 user 消息：只有外部要点与问题（无纪要上下文）"""
     return (f'外部资料要点（已清洗去重，来源真实可引用）：\n{_external_context(findings)}'
@@ -244,10 +286,18 @@ def _general_user(question: str, findings: list[dict]) -> str:
 
 def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
     """通用问答（无纪要目标）：联网检索 → 清洗 → flash 生成外部知识回答（JSON：answer + followups）。
-    返回 (answer, refs, followups)；外部检索不可用 / 无可靠依据返回 None，由调用方用固定话术兜底。"""
+    日常对话（寒暄 / 问身份等）不经检索直接回复；返回 (answer, refs, followups)；
+    外部检索不可用 / 无可靠依据返回 None，由调用方用固定话术兜底。"""
     try:
+        reply = _chat_reply(question) if _looks_chitchat(question) else None
+        if reply:
+            return reply, [], []
         findings = _pick_findings(question)
         if not findings:
+            # 检索一无所获再补一次对话判定：漏网寒暄（「在吗？」）不硬拒
+            reply = _chat_reply(question)
+            if reply:
+                return reply, [], []
             return None
         data = llm.chat_json(
             [{'role': 'system', 'content': _system(_GENERAL_RULES, stream=False)},
@@ -273,12 +323,21 @@ def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
 
 def answer_stream_general(question: str):
     """通用问答流式版（无纪要目标）：外部检索 → 流式生成，事件与 answer_stream 一致；
-    外部检索不可用时 yield 固定话术后正常结束（不降级演示检索——通用模式没有纪要可检）。"""
+    日常对话不经检索直接回复；外部检索不可用时 yield 固定话术后正常结束
+    （不降级演示检索——通用模式没有纪要可检）。"""
     try:
+        reply = _chat_reply(question) if _looks_chitchat(question) else None
+        if reply:
+            yield {'type': 'delta', 'text': reply}
+            yield {'type': 'end', 'refs': []}
+            return
         findings = _pick_findings(question)
         if not findings:
-            text = no_general_answer()
-            yield {'type': 'delta', 'text': text}
+            # 检索一无所获再补一次对话判定：漏网寒暄不硬拒
+            reply = _chat_reply(question)
+            if not reply:
+                reply = no_general_answer()
+            yield {'type': 'delta', 'text': reply}
             yield {'type': 'end', 'refs': []}
             return
         stream = llm.chat_stream(
@@ -324,6 +383,9 @@ def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] 
     由调用方降级演示检索。
     """
     try:
+        reply = _chat_reply(question) if _looks_chitchat(question) else None
+        if reply:
+            return reply, [], []
         scored = retrieve_scored(note, question)
         if not scored and not llm.available():
             return None
@@ -333,6 +395,10 @@ def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] 
 
         if not scored or best < KB_WEAK:   # 知识库未命中（无片段或相似度过低）
             if not findings:
+                # 知识库与外部都没有依据：再补一次对话判定，漏网寒暄不回「纪要无依据」
+                reply = _chat_reply(question)
+                if reply:
+                    return reply, [], []
                 answer = _no_basis_answer(note)
                 return answer, [], []
             mode, rules = 'external', _EXTERNAL_RULES
@@ -385,6 +451,11 @@ def answer_stream(note: Note, question: str):
     基础设施失败 / 流异常 yield {'type': 'error'}，由调用方降级演示检索。
     """
     try:
+        reply = _chat_reply(question) if _looks_chitchat(question) else None
+        if reply:
+            yield {'type': 'delta', 'text': reply}
+            yield {'type': 'end', 'refs': []}
+            return
         scored = retrieve_scored(note, question)
         if not scored and not llm.available():
             yield {'type': 'error'}
@@ -395,8 +466,11 @@ def answer_stream(note: Note, question: str):
 
         if not scored or best < KB_WEAK:   # 知识库未命中（无片段或相似度过低）
             if not findings:
-                text = _no_basis_answer(note)
-                yield {'type': 'delta', 'text': text}
+                # 知识库与外部都没有依据：再补一次对话判定，漏网寒暄不回「纪要无依据」
+                reply = _chat_reply(question)
+                if not reply:
+                    reply = _no_basis_answer(note)
+                yield {'type': 'delta', 'text': reply}
                 yield {'type': 'end', 'refs': []}
                 return
             mode, rules = 'external', _EXTERNAL_RULES
