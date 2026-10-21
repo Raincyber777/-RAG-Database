@@ -1,2 +1,5 @@
 # 完整依赖清单在 mysite/requirements.txt（部署打包用），此处透传保持单一来源
 -r mysite/requirements.txt
+
+# Bundled Agent runtime
+-r requirements-agent.txt

@@ -1,0 +1,33 @@
+[project]
+name = "agent"
+version = "0.1.0"
+description = "智学纪要：具备证据校验和任务工具的课堂助教 Agent"
+readme = "README.md"
+authors = [
+    { name = "g-g23456", email = "256880141@qq.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.4.6",
+    "langchain-openai>=1.1",
+    "langgraph>=1.2.16",
+    "langgraph-checkpoint-postgres",
+    "psycopg[binary,pool]",
+    "httpx>=0.28",
+    "pydantic>=2.10,<3",
+    "python-dotenv>=1.0",
+    "fastapi>=0.146.0",
+    "alibabacloud-oss-v2>=1.4.0",
+    "pypdf>=5.0",
+    "pypdfium2>=4.30",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "pillow>=10.0",
+]
+
+[project.scripts]
+agent = "agent:main"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"

@@ -4,8 +4,24 @@
 TODO：接入向量检索（pgvector）后按相似度召回纪要片段，由 LLM 生成答案；
 当前 demo_answer 提供基于关键词重合的占位检索，保证问答闭环可演示。
 """
+import uuid
 from django.conf import settings
 from django.db import models
+
+
+class QaSession(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='qa_sessions')
+    ref = models.CharField(max_length=64, default=uuid.uuid4, unique=True)
+    title = models.CharField(max_length=200, default='新的对话')
+    note = models.ForeignKey('notes.Note', null=True, blank=True, on_delete=models.SET_NULL)
+    pinned = models.BooleanField(default=False)
+    pinned_at = models.DateTimeField(null=True, blank=True)
+    deleted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-pinned', '-pinned_at', '-updated_at', '-id']
 
 
 class QaRecord(models.Model):
@@ -18,6 +34,7 @@ class QaRecord(models.Model):
         on_delete=models.CASCADE, related_name='qa_records',
         null=True, blank=True,  # 通用问答（账号尚无已完成纪要，纯外部检索回答）为空
     )
+    session = models.ForeignKey(QaSession, null=True, blank=True, on_delete=models.CASCADE, related_name='records')
     question = models.TextField('问题')
     answer = models.TextField('回答')
     references = models.JSONField('引用来源', default=list, blank=True)  # [{label, time, note_title}]

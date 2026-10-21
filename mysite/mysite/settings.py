@@ -9,17 +9,17 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
-# Agent reads its model/search options from its own .env (process env takes priority).
-AGENT_ENABLED = os.environ.get('AGENT_ENABLED', '1').lower() in ('1', 'true', 'yes')
-AGENT_TENANT_ID = os.environ.get('AGENT_TENANT_ID', 'classroom')
-AGENT_MAX_MODEL_CALLS = int(os.environ.get('AGENT_MAX_MODEL_CALLS', '8'))
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# 后端专用配置；进程环境变量优先，不读取 Agent 的 OSS 密钥。
+# 后端与 Agent 统一配置；进程环境变量优先。
 from dotenv import load_dotenv
-load_dotenv(BASE_DIR.parent / '.env', override=False)
+load_dotenv(BASE_DIR.parent / '.env', override=False, interpolate=False)
+
+# Agent switches use the same root .env; process variables take priority.
+AGENT_ENABLED = os.environ.get('AGENT_ENABLED', '1').lower() in ('1', 'true', 'yes')
+AGENT_TENANT_ID = os.environ.get('AGENT_TENANT_ID', 'classroom')
+AGENT_MAX_MODEL_CALLS = int(os.environ.get('AGENT_MAX_MODEL_CALLS', '8'))
 
 
 # Quick-start development settings - unsuitable for production

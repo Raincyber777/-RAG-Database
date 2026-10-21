@@ -31,7 +31,7 @@ def enabled():
 
 
 def agent_settings():
-    """Keep Agent .env search credentials while respecting explicit Django overrides."""
+    """Keep shared .env search credentials while respecting explicit Django overrides."""
     from agent.gateway import Settings
     base = Settings.from_env()
     overrides = {}

@@ -21,6 +21,7 @@ from notes.models import Note
 from .models import QaRecord
 from .serializers import AskSerializer, QaRecordSerializer
 from . import agent_bridge
+from .sessions import prepare_session, save_answer
 
 
 def _score(question: str, text: str) -> int:
@@ -183,6 +184,9 @@ class AskView(APIView):
         data = ser.validated_data
 
         note = _resolve_ask_note(request, data.get('note_id'))
+        session = prepare_session(request.user, data, note)
+        if session.note_id:
+            note = _resolve_ask_note(request, session.note_id)
         question = data['question']
 
         use_agent = agent_bridge.enabled()
@@ -204,10 +208,9 @@ class AskView(APIView):
             else:
                 answer, refs = demo_answer(note, question)
                 followups = []
-        record = QaRecord.objects.create(
+        record = save_answer(session,
             user=request.user, note=note, question=question,
             answer=answer, references=refs, followups=followups,
-            session_ref=data.get('session_ref', ''),
         )
         response = Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
         response['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
@@ -249,6 +252,9 @@ class AskStreamView(APIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         note = _resolve_ask_note(request, data.get('note_id'))
+        session = prepare_session(request.user, data, note)
+        if session.note_id:
+            note = _resolve_ask_note(request, session.note_id)
         question = data['question']
         general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
         use_agent = agent_bridge.enabled()
@@ -259,9 +265,9 @@ class AskStreamView(APIView):
                 with closing(agent_bridge.stream(request.user, note, question)) as events:
                     for event in events:
                         if event['event'] == 'done':
-                            record = QaRecord.objects.create(
+                            record = save_answer(session,
                                 user=request.user, note=note, question=question,
-                                session_ref=data.get('session_ref', ''), **event['data'],
+                                **event['data'],
                             )
                             yield _sse('done', QaRecordSerializer(record).data)
                             return
@@ -288,11 +294,10 @@ class AskStreamView(APIView):
                 else:
                     buf, refs = demo_answer(note, question)
                     yield _sse('delta', {'text': buf})
-            record = QaRecord.objects.create(
+            record = save_answer(session,
                 user=request.user, note=note, question=question,
                 answer=buf, references=refs, followups=_stream_followups(note, question, buf),
-                session_ref=data.get('session_ref', ''),
-            )
+                )
             yield _sse('done', QaRecordSerializer(record).data)
 
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')
@@ -316,7 +321,7 @@ class QaListView(ListAPIView):
         # 按前端自由对话会话拉历史（刷新后恢复会话消息）
         session = (self.request.query_params.get('session') or '').strip()
         if session:
-            qs = qs.filter(session_ref=session)
+            qs = qs.filter(session_ref=session).order_by('created_at', 'id')
         keyword = (self.request.query_params.get('search') or '').strip()
         if keyword:
             qs = qs.filter(question__icontains=keyword)

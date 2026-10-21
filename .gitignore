@@ -18,3 +18,7 @@ mysite/local_settings.py
 .idea/
 .vscode/
 .DS_Store
+
+# Preserved pre-migration local metadata and environment
+agent/.git-before-move/
+agent/.venv-before-move/

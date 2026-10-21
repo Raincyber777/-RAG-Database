@@ -11,7 +11,7 @@
 
 ## 安装和启动
 
-Python 3.11+。请在**启动 Django 的同一个虚拟环境**中安装两个仓库的依赖。
+Python 3.11+。请在**启动 Django 的同一个虚拟环境**中安装后端与内置 Agent 的依赖。
 以下命令从后端仓库根目录（`E:\agant\-RAG-Database`）执行：
 
 ```powershell
@@ -22,8 +22,8 @@ $env:AGENT_ENABLED = '1'
 python mysite/manage.py runserver 127.0.0.1:8080
 ```
 
-`requirements-agent.txt` 依赖同级 `../agent` 项目。服务器没有同级源码时，
-先在 Agent 仓库运行 `uv build`，把产生的 wheel 安装进后端环境，然后按原部署方式启动。
+`requirements-agent.txt` 依赖后端内部的 `./agent`。根 requirements.txt 已包含该文件，
+安装后端依赖会同时安装 Agent。部署包也包含 agent/，服务器不再需要同级 Agent 仓库。
 不需要额外启动 FastAPI 或 Agent HTTP 服务。没有数据库模型变动，无新增 migration。
 
 默认启用 Agent。未安装 Agent 包或未配置 key 时，保持旧 RAG/演示检索路径；
@@ -55,13 +55,13 @@ python mysite/manage.py runserver 127.0.0.1:8080
 `session_ref` 用于保存与恢复前端会话历史；目前不将历史重新传给模型，
 也不提供跨请求 Agent 记忆。历史仍保存在 QaRecord。
 
-Agent 配置通过 `Settings.from_env()` 读取同级 Agent 项目 `.env`，系统环境变量优先。
+Agent 配置通过 `Settings.from_env()` 读取后端根目录统一的 `.env`，系统环境变量优先。
 默认搜索为 Tavily，读取 `TAVILY_API_KEY`；`AGENT_SEARCH_PROVIDER=dashscope` 可显式回退。
 桥接层保留完整搜索配置，同时优先使用 Django 已配置的 `DASHSCOPE_API_KEY`；
-Django 未配置模型 Key 时使用 Agent `.env` 中的模型 Key。
+Django 与 Agent 默认使用统一 `.env` 中的模型 Key。
 可选环境变量：`AGENT_CHAT_MODEL`、`AGENT_FAST_MODEL`、`AGENT_TIMEOUT`、
 `AGENT_ENABLE_SEARCH`、`DASHSCOPE_BASE_URL`、`AGENT_TENANT_ID`。
-原后端上传/向量化仍使用 Django 自己的模型配置，Agent `.env` 不会改写它。
+原后端上传/向量化仍使用 Django 的模型配置；模型密钥与 Agent 从统一 `.env` 加载。
 
 ## 离线验证
 
