@@ -26,6 +26,7 @@ urlpatterns = [
     path('api/', include('feedback.urls')),
     path('api/', include('faq.urls')),
     path('api/', include('announcements.urls')),
+    path('api/', include('safety.urls')),
     path('api/stats/summary/', StatsSummaryView.as_view()),
     path('api/stats/dashboard/', DashboardFeedView.as_view()),
 ]

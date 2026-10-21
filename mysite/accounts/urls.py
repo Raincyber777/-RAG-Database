@@ -22,6 +22,7 @@ urlpatterns = [
     # 管理端账号管理
     path('admin/accounts/', views.AdminAccountListView.as_view()),
     path('admin/accounts/create/', views.AdminAccountCreateView.as_view()),
+    path('admin/accounts/batch_reset_password/', views.AdminAccountBatchResetPasswordView.as_view()),
     path('admin/accounts/<int:pk>/reset_password/', views.AdminAccountResetPasswordView.as_view()),
     path('admin/accounts/<int:pk>/toggle_status/', views.AdminAccountToggleStatusView.as_view()),
 ]

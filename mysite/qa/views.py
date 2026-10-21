@@ -1,11 +1,16 @@
 """
 问答接口：
-- 用户端：提问（一次性 / SSE 流式，返回答案 + 引用来源 + 追问）/ 历史记录 / 点赞
-- 管理端：全部问答记录巡检
+- 用户端：提问（一次性 / SSE 流式，返回答案 + 引用来源 + 追问）/ 历史记录 / 点赞 / 反馈埋点
+- 安全门禁：敏感内容审核（拦截 / 政治引导）+ 健康档案提取与禁忌阻断（mysite/moderation.py）
+- 数据进化：召回片段落库、反馈升降片段权重、知识库缺口聚合、训练样本池（强审核）
+- 管理端：全部问答记录巡检 / 训练样本审核与导出
 """
+import hashlib
 import json
 
-from django.http import StreamingHttpResponse
+from django.db.models import F, Q
+from django.db.models.functions import Greatest, Least
+from django.http import HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import ListAPIView
@@ -14,11 +19,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from mysite.utils import IsAdminRole
-from mysite import llm, rag
-from notes.models import Note
+from mysite import llm, moderation, rag
+from notes.models import Note, NoteChunk
+from safety.masking import mask_contact, mask_health_detail
+from safety.models import HealthProfile, SensitiveAuditLog
 
-from .models import QaRecord
-from .serializers import AskSerializer, QaRecordSerializer
+from .models import KnowledgeGap, QaFeedback, QaRecord, TrainingSample
+from .serializers import (AskSerializer, KnowledgeGapSerializer, QaRecordSerializer,
+                          TrainingSampleSerializer)
 
 
 def _score(question: str, text: str) -> int:
@@ -42,6 +50,119 @@ def demo_answer(note: Note, question: str) -> tuple[str, list[dict]]:
     body = '\n'.join(f'· {c["text"]}' for c in top)
     answer = f'根据《{note.title}》的纪要内容：\n{body}\n\n以上内容可在「引用来源」中核对原文（演示检索）。'
     return answer, refs
+
+
+# ---------- 安全门禁与进化辅助 ----------
+
+def _audit(user, kind: str, action: str, question: str, detail: list | None = None):
+    """敏感事件入审计日志：内容与词条一律先脱敏（避免明文留存）。"""
+    try:
+        SensitiveAuditLog.objects.create(
+            user=user, kind=kind, action=action,
+            question=mask_contact(question)[:500],
+            detail=detail or [],
+        )
+    except Exception:
+        pass  # 审计失败不影响问答主链路
+
+
+def _rewrite_question(user, session_ref: str, question: str) -> str:
+    """会话内追问改写：结合本会话最近两轮把「那第二种呢？」改写成独立完整的问题，
+    检索与生成都用改写结果；无历史 / 超时 / 失败一律回退原文。"""
+    if not session_ref:
+        return ''
+    prior = list(QaRecord.objects.filter(user=user, session_ref=session_ref)
+                 .order_by('-created_at').values('question', 'answer')[:2])
+    if not prior:
+        return ''
+    context = '\n'.join(f'问：{p["question"]}\n答（节选）：{p["answer"][:120]}' for p in reversed(prior))
+    data = llm.chat_json(
+        [{'role': 'system', 'content': (
+            '根据最近的对话上下文，把学生这条新消息改写成一个不依赖上下文、独立完整的问题。'
+            '消息本身已经完整时原样保留。只输出 JSON：{"question": "..."}')},
+         {'role': 'user', 'content': f'最近对话：\n{context}\n\n学生新消息：{question}'}],
+        model=llm.MODEL_LITE, temperature=0.1, timeout=4,
+    )
+    if not isinstance(data, dict):
+        return ''
+    rewritten = str(data.get('question') or '').strip()
+    return rewritten[:500] if 2 <= len(rewritten) <= 300 else ''
+
+
+def _health_gate(user, question: str) -> tuple[bool, str]:
+    """健康链路：词命中 → 提取建档；求建议且档案非空 → 禁忌比对，命中返回拦截文案。
+    返回 (profile_updated, blocked_message)。"""
+    profile_updated = False
+    if not (moderation.health_hit(question) or moderation.health_advice_hit(question)):
+        return False, ''
+    profile, _ = HealthProfile.objects.get_or_create(user=user)
+    if moderation.health_hit(question):
+        extracted = moderation.extract_health(question)
+        if extracted and profile.merge(extracted):
+            profile.save()
+            profile_updated = True
+            _audit(user, 'health_extract', 'extract', question,
+                   mask_health_detail([it for items in extracted.values() for it in items]))
+    if moderation.health_advice_hit(question):
+        items = profile.items()
+        if items:
+            conflicts = moderation.contraindication_conflict(question, items)
+            if conflicts:
+                _audit(user, 'health_block', 'block', question, mask_health_detail(conflicts))
+                return profile_updated, moderation.health_block_message(conflicts)
+    return profile_updated, ''
+
+
+def _prepare_ask(user, data: dict) -> dict:
+    """提问前置三步：内容审核 → 健康门禁 → 会话改写。
+    返回 {'reject': msg} / {'health_block': msg} / 正常 {'question', 'rewrite', 'profile_updated'}。
+    政治引导不在这里拦（作为正常回答流下发），由调用方按 moderate 结果处理。"""
+    question = data['question']
+    verdict = moderation.moderate(question)
+    if verdict['verdict'] == 'block':
+        _audit(user, 'blocked', 'block', question)
+        return {'reject': verdict['message']}
+    profile_updated, blocked = _health_gate(user, question)
+    if blocked:
+        return {'health_block': blocked}
+    return {
+        'question': question,
+        'moderate': verdict,
+        'rewrite': _rewrite_question(user, data.get('session_ref', ''), question),
+        'profile_updated': profile_updated,
+    }
+
+
+def _upsert_gap(record: QaRecord):
+    """知识库缺口聚合：无依据问题按规范化 key 聚合计数，供管理端补充材料。"""
+    key = ''.join(record.question.split())[:50].lower()
+    if not key:
+        return
+    gap = KnowledgeGap.objects.filter(key=key).first()
+    if gap:
+        gap.count = F('count') + 1
+        gap.sample_record = record
+        gap.status = KnowledgeGap.Status.OPEN if gap.status != KnowledgeGap.Status.RESOLVED else gap.status
+        gap.save(update_fields=['count', 'sample_record', 'updated_at'])
+    else:
+        KnowledgeGap.objects.create(key=key, question=record.question[:200], sample_record=record)
+
+
+def _evolve_weights(record: QaRecord, action: str, value: str):
+    """反馈闭环：按消息反馈升降召回 top1 片段的权重（clamp 0.2~2.0）。
+    点赞 / 复制 / 停留 ≥30s 上调；点踩 / 重新提问下调；点踩且无知识库引用 → 记知识库缺口。"""
+    delta = {'like': 0.05, 'copy': 0.05, 'dislike': -0.10, 'reask': -0.05}.get(action, 0.0)
+    if action == 'dwell':
+        try:
+            delta = 0.05 if float(value or 0) >= 30 else 0.0
+        except ValueError:
+            delta = 0.0
+    top = next((e for e in (record.retrieval or []) if e.get('chunk_id')), None)
+    if delta and top:
+        NoteChunk.objects.filter(id=top['chunk_id']).update(
+            weight=Least(Greatest(F('weight') + delta, rag.WEIGHT_MIN), rag.WEIGHT_MAX))
+    if action == 'dislike' and not any(r.get('kind') == 'kb' for r in (record.references or [])):
+        _upsert_gap(record)
 
 
 class SuggestionsView(APIView):
@@ -165,6 +286,13 @@ def _resolve_ask_note(request, note_id) -> Note | None:
     return note or Note.objects.filter(uploader=request.user, status=Note.Status.DONE).first()
 
 
+def _finish_answer(answer: str, question: str) -> str:
+    """回答收尾：健康建议类提问统一追加医疗免责（代码拼装，不依赖模型）。"""
+    if moderation.health_advice_hit(question):
+        answer += moderation.MEDICAL_DISCLAIMER
+    return answer
+
+
 class AskView(APIView):
     """POST /api/qa/ask/ —— 提问，一次性返回完整回答（body: {note_id?, question}）"""
 
@@ -175,28 +303,62 @@ class AskView(APIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
 
-        note = _resolve_ask_note(request, data.get('note_id'))
-        question = data['question']
+        prep = _prepare_ask(request.user, data)
+        if 'reject' in prep:
+            return Response({'detail': prep['reject'], 'category': 'blocked'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if note is None:
+        note = _resolve_ask_note(request, data.get('note_id'))
+        question = prep['question']
+        moderation_flag = ''
+
+        if 'health_block' in prep:
+            answer, refs, followups = prep['health_block'], [], []
+            moderation_flag = 'health_block'
+        elif prep['moderate'].get('verdict') == 'redirect':
+            answer, refs, followups = prep['moderate']['message'], [], []
+            moderation_flag = 'political'
+            _audit(request.user, 'political', 'redirect', question)
+        elif note is None:
             # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
-            result = rag.answer_general(question)
+            result = rag.answer_general(prep['rewrite'] or question)
             if result is not None:
                 answer, refs, followups = result
             else:
                 answer, refs, followups = rag.no_general_answer(), [], []
+            answer = _finish_answer(answer, question)
         else:
             # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
-            result = rag.answer_note(note, question)
+            collect: dict = {}
+            result = rag.answer_note(note, prep['rewrite'] or question, collect=collect)
             if result is not None:
                 answer, refs, followups = result
             else:
                 answer, refs = demo_answer(note, question)
                 followups = []
+                collect = {}
+            answer = _finish_answer(answer, question)
+
+            record = QaRecord.objects.create(
+                user=request.user, note=note, question=question,
+                answer=answer, references=refs, followups=followups,
+                session_ref=data.get('session_ref', ''),
+                question_rewrite=prep['rewrite'],
+                retrieval=collect.get('retrieval', []),
+                used_external=collect.get('used_external', False),
+                profile_updated=prep['profile_updated'],
+                moderation=moderation_flag,
+            )
+            if collect.get('mode') == 'no_basis':
+                _upsert_gap(record)
+            return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
+
         record = QaRecord.objects.create(
             user=request.user, note=note, question=question,
             answer=answer, references=refs, followups=followups,
             session_ref=data.get('session_ref', ''),
+            question_rewrite=prep['rewrite'],
+            profile_updated=prep['profile_updated'],
+            moderation=moderation_flag,
         )
         return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
 
@@ -208,6 +370,8 @@ def _stream_followups(note: Note | None, question: str, answer: str) -> list[str
     prompt = (
         f'{head}，助教已作答（节选）：{answer[:400]}'
         '\n请给 3 条学生最可能接着问的追问，中文、每条不超过 16 字。'
+        '只提围绕课程知识、刚才回答内容或本产品功能（上传材料 / 生成纪要 / 出题练习）的问题；'
+        '作业提交、成绩查询、截止时间等本产品没有的功能不要提。'
         '只输出 JSON：{"followups": ["...", "...", "..."]}'
     )
     data = llm.chat_json([{'role': 'user', 'content': prompt}], model=llm.MODEL_LITE, temperature=0.7)
@@ -224,7 +388,8 @@ def _sse(event: str, payload: dict) -> str:
 
 class AskStreamView(APIView):
     """POST /api/qa/ask/stream/ —— SSE 流式提问（text/event-stream）
-    事件流：delta（回答增量，逐段下发）→ done（完整问答记录，含引用与追问）。
+    事件流：delta（回答增量）→ done（完整问答记录，含引用与追问）；
+    安全拦截时下发 blocked（违规）或按正常回答流下发引导 / 安全警告（moderation 标记随 done 带回）。
     真流式：向量召回后 qwen-plus 逐 token 生成；RAG 不可用时降级演示检索一次性下发；
     流中断时以已生成内容收尾（无引用），保证前端总能拿到 done 记录入库。
     """
@@ -236,36 +401,70 @@ class AskStreamView(APIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         note = _resolve_ask_note(request, data.get('note_id'))
-        question = data['question']
         general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
+        user = request.user
 
         def sse():
+            prep = _prepare_ask(user, data)
+            if 'reject' in prep:
+                yield _sse('blocked', {'category': 'blocked', 'message': prep['reject']})
+                return
+            question = prep['question']
+            rag_question = prep['rewrite'] or question
             buf, refs = '', []
-            try:
-                gen = rag.answer_stream_general(question) if general else rag.answer_stream(note, question)
-                for ev in gen:
-                    if ev['type'] == 'delta':
-                        buf += ev['text']
-                        yield _sse('delta', {'text': ev['text']})
-                    elif ev['type'] == 'end':
-                        refs = ev.get('refs') or []
-                        break
-                    else:  # error：已有增量则就地收尾，否则走演示降级
-                        break
-            except Exception:
-                pass  # 流中断：以已生成内容收尾
-            if not buf:
-                if general:
-                    buf = rag.no_general_answer()
-                    yield _sse('delta', {'text': buf})
-                else:
-                    buf, refs = demo_answer(note, question)
-                    yield _sse('delta', {'text': buf})
+            extra: dict = {}
+            moderation_flag = ''
+
+            if 'health_block' in prep:
+                buf = prep['health_block']
+                moderation_flag = 'health_block'
+                refs = []
+                yield _sse('delta', {'text': buf})
+            elif prep['moderate'].get('verdict') == 'redirect':
+                buf = prep['moderate']['message']
+                moderation_flag = 'political'
+                _audit(user, 'political', 'redirect', question)
+                yield _sse('delta', {'text': buf})
+            else:
+                try:
+                    gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
+                    for ev in gen:
+                        if ev['type'] == 'delta':
+                            buf += ev['text']
+                            yield _sse('delta', {'text': ev['text']})
+                        elif ev['type'] == 'end':
+                            refs = ev.get('refs') or []
+                            extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                            break
+                        else:  # error：已有增量则就地收尾，否则走演示降级
+                            break
+                except Exception:
+                    pass  # 流中断：以已生成内容收尾
+                if not buf:
+                    if general:
+                        buf = rag.no_general_answer()
+                        yield _sse('delta', {'text': buf})
+                    else:
+                        buf, refs = demo_answer(note, question)
+                        yield _sse('delta', {'text': buf})
+                tail = moderation.MEDICAL_DISCLAIMER
+                if moderation.health_advice_hit(question) and '不构成医疗建议' not in buf:
+                    buf += tail
+                    yield _sse('delta', {'text': tail})
+
             record = QaRecord.objects.create(
-                user=request.user, note=note, question=question,
-                answer=buf, references=refs, followups=_stream_followups(note, question, buf),
+                user=user, note=note, question=question,
+                answer=buf, references=refs,
+                followups=[] if moderation_flag else _stream_followups(note, question, buf),
                 session_ref=data.get('session_ref', ''),
+                question_rewrite=prep['rewrite'],
+                retrieval=extra.get('retrieval', []),
+                used_external=extra.get('used_external', False),
+                profile_updated=prep['profile_updated'],
+                moderation=moderation_flag,
             )
+            if extra.get('mode') == 'no_basis':
+                _upsert_gap(record)
             yield _sse('done', QaRecordSerializer(record).data)
 
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')
@@ -309,6 +508,159 @@ class QaLikeView(APIView):
         return Response(QaRecordSerializer(record).data)
 
 
+class QaFeedbackView(APIView):
+    """POST /api/qa/{id}/feedback/ —— 按消息反馈埋点（like/dislike/copy/reask/dwell）
+    写 QaFeedback 流水；like/dislike 同步 QaRecord.liked；并驱动片段权重升降（数据进化）。"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        record = QaRecord.objects.filter(pk=pk, user=request.user).first()
+        if record is None:
+            return Response({'detail': '记录不存在'}, status=status.HTTP_404_NOT_FOUND)
+        action = str(request.data.get('action') or '')
+        if action not in QaFeedback.Action.values:
+            return Response({'detail': '无效的反馈类型'}, status=status.HTTP_400_BAD_REQUEST)
+        value = str(request.data.get('value') or '')[:200]
+        QaFeedback.objects.create(user=request.user, record=record, action=action, value=value)
+        if action in ('like', 'dislike'):
+            record.liked = action == 'like'
+            record.save(update_fields=['liked'])
+        _evolve_weights(record, action, value)
+        return Response({'action': action, 'liked': record.liked})
+
+
+# ---------- 训练样本（强审核：生成 → 待审核 → 人工通过 → 导出） ----------
+
+class TrainingGenerateView(APIView):
+    """POST /api/admin/training/generate/ —— 从高质量问答生成训练样本候选
+    选材：课内问答 + 有正反馈（点赞 / 复制 / 停留）+ 无审核标记 + 有召回片段 + 答案非兜底话术；
+    清洗：剥来源说明尾缀（引用已在 references 结构化）、按 规范化问题+top片段 去重；
+    过滤：qwen-plus 判定答案是否扎根召回片段；全部落 pending，人工审核后才可导出。
+    单次最多处理 30 条，防止同步请求超时。"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+    LIMIT = 30
+
+    def post(self, request):
+        candidates = (QaRecord.objects
+                      .filter(note__isnull=False, moderation='')
+                      .filter(Q(liked=True) | Q(feedbacks__action__in=('copy', 'dwell')))
+                      .exclude(answer__contains='暂时无法确认')
+                      .distinct().order_by('-created_at'))
+        created = skipped = judged = 0
+        for record in candidates:
+            if created + judged >= self.LIMIT:
+                break
+            if not record.retrieval or len(record.answer) < 50 or len(record.answer) > 2000:
+                continue
+            if TrainingSample.objects.filter(record=record).exists():
+                skipped += 1
+                continue
+            # 清洗：剥掉回答尾部的来源说明（来源已结构化在 references）
+            answer = record.answer.split('—— 来源说明 ——')[0].strip()
+            if len(answer) < 50:
+                continue
+            top_id = next((e['chunk_id'] for e in record.retrieval if e.get('chunk_id')), None)
+            if top_id is None:
+                continue
+            dedup_key = ''.join(record.question.split())[:80] + f'|{top_id}'
+            dedup_hash = hashlib.sha256(dedup_key.encode()).hexdigest()
+            if TrainingSample.objects.filter(dedup_hash=dedup_hash).exists():
+                skipped += 1
+                continue
+            chunks = NoteChunk.objects.in_bulk([e['chunk_id'] for e in record.retrieval if e.get('chunk_id')])
+            context = [{'text': chunks[e['chunk_id']].text, 'ref': e.get('ref', ''), 'score': e.get('score', 0)}
+                       for e in record.retrieval if e.get('chunk_id') in chunks][:4]
+            if not context:
+                continue
+            if llm.available() and not _sample_quality_ok(record.question, answer, context):
+                skipped += 1
+                judged += 1
+                continue
+            TrainingSample.objects.create(
+                record=record, note=record.note,
+                query=record.question, question_rewrite=record.question_rewrite,
+                context=context, answer=answer, sources=record.references or [],
+                dedup_hash=dedup_hash,
+            )
+            created += 1
+        return Response({'created': created, 'skipped': skipped})
+
+
+def _sample_quality_ok(question: str, answer: str, context: list[dict]) -> bool:
+    """强模型预筛：答案是否扎根召回片段、完整且无明显编造；判定失败按通过处理（人工审核兜底）。"""
+    ctx = '\n'.join(f'[{i + 1}] ({c["ref"]}) {c["text"]}' for i, c in enumerate(context))
+    data = llm.chat_json(
+        [{'role': 'system', 'content': (
+            '你是训练样本质检员。给定学生问题、课堂纪要片段和候选答案，判断该问答是否适合作为训练样本：'
+            '1）答案确实依据片段作答、无明显编造；2）回答完整、可直接用于教学场景；'
+            '3）没有针对个人的内容。任一不满足 → ok=false。'
+            '只输出 JSON：{"ok": true 或 false}')},
+         {'role': 'user', 'content': f'问题：{question}\n\n纪要片段：\n{ctx}\n\n候选答案：\n{answer[:1200]}'}],
+        model=llm.MODEL_CHAT, temperature=0.1, timeout=15,
+    )
+    if not isinstance(data, dict):
+        return True
+    return bool(data.get('ok', True))
+
+
+class TrainingSampleListView(ListAPIView):
+    """GET /api/admin/training/samples/?status= —— 训练样本池巡检"""
+
+    serializer_class = TrainingSampleSerializer
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def get_queryset(self):
+        qs = TrainingSample.objects.select_related('note', 'record')
+        st = (self.request.query_params.get('status') or '').strip()
+        if st:
+            qs = qs.filter(status=st)
+        return qs
+
+
+class TrainingSampleReviewView(APIView):
+    """POST /api/admin/training/samples/{id}/review/ —— 人工审核（body: {action: approve|reject, note?}）"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def post(self, request, pk):
+        sample = TrainingSample.objects.filter(pk=pk).first()
+        if sample is None:
+            return Response({'detail': '样本不存在'}, status=status.HTTP_404_NOT_FOUND)
+        action = str(request.data.get('action') or '')
+        if action == 'approve':
+            sample.status = TrainingSample.Status.APPROVED
+        elif action == 'reject':
+            sample.status = TrainingSample.Status.REJECTED
+        else:
+            return Response({'detail': 'action 须为 approve / reject'}, status=status.HTTP_400_BAD_REQUEST)
+        sample.reviewer_note = str(request.data.get('note') or '')[:200]
+        sample.save(update_fields=['status', 'reviewer_note', 'updated_at'])
+        return Response(TrainingSampleSerializer(sample).data)
+
+
+class TrainingSampleExportView(APIView):
+    """GET /api/admin/training/samples/export/ —— 导出已通过样本为 JSONL
+    每行：{query, question_rewrite, context: [{text, ref, score}], answer, sources}"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def get(self, request):
+        lines = [
+            json.dumps({
+                'query': s.query, 'question_rewrite': s.question_rewrite,
+                'context': s.context, 'answer': s.answer, 'sources': s.sources,
+            }, ensure_ascii=False)
+            for s in TrainingSample.objects.filter(status=TrainingSample.Status.APPROVED)
+                                            .select_related('note').order_by('id')
+        ]
+        resp = HttpResponse('\n'.join(lines) + ('\n' if lines else ''),
+                            content_type='application/x-ndjson')
+        resp['Content-Disposition'] = 'attachment; filename=training_samples.jsonl'
+        return resp
+
+
 class AdminQaListView(ListAPIView):
     """GET /api/admin/qa/ —— 全部问答记录（?search=）"""
 
@@ -322,3 +674,58 @@ class AdminQaListView(ListAPIView):
         if keyword:
             qs = qs.filter(question__icontains=keyword)
         return qs
+
+
+class AdminQaBatchDeleteView(APIView):
+    """POST /api/admin/qa/batch_delete/ —— 批量删除问答记录（body: {ids: [...]}）
+    名下反馈流水随 CASCADE 一并清除；返回实际删除条数。"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def post(self, request):
+        ids = request.data.get('ids')
+        if not isinstance(ids, list) or not ids:
+            return Response({'detail': '请先勾选要删除的记录'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            id_list = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return Response({'detail': '记录标识有误'}, status=status.HTTP_400_BAD_REQUEST)
+        qs = QaRecord.objects.filter(pk__in=id_list)
+        deleted = qs.count()
+        qs.delete()
+        return Response({'detail': f'已删除 {deleted} 条问答记录', 'deleted': deleted})
+
+
+# ---------- 知识库缺口（无依据问题聚合，补充材料后闭环） ----------
+
+class AdminKbGapListView(ListAPIView):
+    """GET /api/admin/kb/gaps/?status= —— 知识库缺口列表（模型默认按出现次数降序）"""
+
+    serializer_class = KnowledgeGapSerializer
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def get_queryset(self):
+        qs = KnowledgeGap.objects.all()
+        st = (self.request.query_params.get('status') or '').strip()
+        if st:
+            qs = qs.filter(status=st)
+        return qs
+
+
+class KbGapActionView(APIView):
+    """POST /api/admin/kb/gaps/{id}/{resolve|ignore}/ —— 标记缺口已补充 / 已忽略"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def post(self, request, pk, action):
+        gap = KnowledgeGap.objects.filter(pk=pk).first()
+        if gap is None:
+            return Response({'detail': '缺口不存在'}, status=status.HTTP_404_NOT_FOUND)
+        if action == 'resolve':
+            gap.status = KnowledgeGap.Status.RESOLVED
+        elif action == 'ignore':
+            gap.status = KnowledgeGap.Status.IGNORED
+        else:
+            return Response({'detail': '未知操作'}, status=status.HTTP_404_NOT_FOUND)
+        gap.save(update_fields=['status', 'updated_at'])
+        return Response(KnowledgeGapSerializer(gap).data)
