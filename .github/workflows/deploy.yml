@@ -35,7 +35,7 @@ jobs:
           --exclude='__pycache__' --exclude='*.pyc'
           --exclude='venv' --exclude='media'
           --exclude='local_settings.py'
-          -C mysite .
+          -C mysite . -C .. agent/src agent/pyproject.toml agent/README.md
 
       - name: Release to ECS
         env:
@@ -101,6 +101,7 @@ jobs:
             [ -d venv ] || python3 -m venv venv
             ./venv/bin/pip install -q --upgrade pip
             ./venv/bin/pip install -q -r requirements.txt
+            ./venv/bin/pip install -q ./agent
             ./venv/bin/python manage.py migrate --noinput
             mkdir -p media
             cp deploy/rag-backend.service /etc/systemd/system/rag-backend.service

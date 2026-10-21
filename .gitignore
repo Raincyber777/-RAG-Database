@@ -10,8 +10,15 @@ media/
 
 # 私密配置（DashScope key 等）——绝不提交
 mysite/local_settings.py
+.env
+.env.*
+!.env.example
 
 # IDE / OS
 .idea/
 .vscode/
 .DS_Store
+
+# Preserved pre-migration local metadata and environment
+agent/.git-before-move/
+agent/.venv-before-move/

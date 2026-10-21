@@ -12,6 +12,15 @@ from pathlib import Path
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# 后端与 Agent 统一配置；进程环境变量优先。
+from dotenv import load_dotenv
+load_dotenv(BASE_DIR.parent / '.env', override=False, interpolate=False)
+
+# Agent switches use the same root .env; process variables take priority.
+AGENT_ENABLED = os.environ.get('AGENT_ENABLED', '1').lower() in ('1', 'true', 'yes')
+AGENT_TENANT_ID = os.environ.get('AGENT_TENANT_ID', 'classroom')
+AGENT_MAX_MODEL_CALLS = int(os.environ.get('AGENT_MAX_MODEL_CALLS', '8'))
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
@@ -169,6 +178,33 @@ STATIC_URL = 'static/'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+RAG_MEDIA_STORAGE = os.environ.get('RAG_MEDIA_STORAGE', 'local').strip().lower()
+OSS_ACCESS_KEY_ID = os.environ.get('OSS_ACCESS_KEY_ID', '')
+OSS_ACCESS_KEY_SECRET = os.environ.get('OSS_ACCESS_KEY_SECRET', '')
+OSS_SECURITY_TOKEN = os.environ.get('OSS_SECURITY_TOKEN', '')
+OSS_BUCKET = os.environ.get('OSS_BUCKET', '')
+OSS_ENDPOINT = os.environ.get('OSS_ENDPOINT', 'https://oss-cn-beijing.aliyuncs.com')
+OSS_PREFIX = os.environ.get('OSS_PREFIX', 'classroom')
+OSS_URL_EXPIRE_SECONDS = int(os.environ.get('OSS_URL_EXPIRE_SECONDS', '900'))
+OSS_CONNECT_TIMEOUT = int(os.environ.get('OSS_CONNECT_TIMEOUT', '30'))
+if RAG_MEDIA_STORAGE not in ('local', 'oss'):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured('RAG_MEDIA_STORAGE must be local or oss')
+STORAGES = {
+    'default': {'BACKEND': ('mysite.media_storage.OSSMediaStorage' if RAG_MEDIA_STORAGE == 'oss'
+                            else 'django.core.files.storage.FileSystemStorage')},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+}
+if RAG_MEDIA_STORAGE == 'oss':
+    # Fail at startup for incomplete configuration; do not fall back to local storage.
+    from django.core.exceptions import ImproperlyConfigured
+    if not all((OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_BUCKET, OSS_ENDPOINT)):
+        raise ImproperlyConfigured('OSS requires OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_BUCKET, OSS_ENDPOINT')
+    if not OSS_ENDPOINT.startswith('https://'):
+        raise ImproperlyConfigured('OSS_ENDPOINT must use HTTPS')
+    if not 60 <= OSS_URL_EXPIRE_SECONDS <= 3600:
+        raise ImproperlyConfigured('OSS_URL_EXPIRE_SECONDS must be between 60 and 3600')
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
@@ -217,4 +253,4 @@ CSRF_TRUSTED_ORIGINS += [o.strip() for o in os.environ.get('RAG_CSRF_ORIGINS', '
 
 # 上传上限：课堂材料 / 截图最大 100MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024
-FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024

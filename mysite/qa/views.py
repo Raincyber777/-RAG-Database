@@ -14,6 +14,7 @@ from django.http import HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import ListAPIView
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -27,6 +28,10 @@ from safety.models import HealthProfile, SensitiveAuditLog
 from .models import KnowledgeGap, QaFeedback, QaRecord, TrainingSample
 from .serializers import (AskSerializer, KnowledgeGapSerializer, QaRecordSerializer,
                           TrainingSampleSerializer)
+from .models import QaRecord
+from .serializers import AskSerializer, QaRecordSerializer
+from . import agent_bridge
+from .sessions import prepare_session, save_answer
 
 
 def _score(question: str, text: str) -> int:
@@ -278,12 +283,17 @@ def _llm_suggestions(recent: list[QaRecord]) -> list[str] | None:
 
 def _resolve_ask_note(request, note_id) -> Note | None:
     """提问目标纪要：显式指定时校验归属（本人或管理员），否则取本人最新已完成纪要"""
-    note = None
-    if note_id:
-        note = Note.objects.filter(pk=note_id).first()
-        if note and note.uploader_id != request.user.pk and not request.user.is_admin_role:
-            note = None
-    return note or Note.objects.filter(uploader=request.user, status=Note.Status.DONE).first()
+    if note_id is not None:
+        notes = Note.objects.filter(pk=note_id)
+        if not request.user.is_admin_role:
+            notes = notes.filter(uploader=request.user)
+        note = notes.first()
+        if note is None:
+            raise NotFound('纪要不存在或无权访问')
+        if note.status != Note.Status.DONE:
+            raise ValidationError({'detail': '请等待当前纪要处理完成后再提问'})
+        return note
+    return Note.objects.filter(uploader=request.user, status=Note.Status.DONE).first()
 
 
 def _finish_answer(answer: str, question: str) -> str:
@@ -318,6 +328,16 @@ class AskView(APIView):
             answer, refs, followups = prep['moderate']['message'], [], []
             moderation_flag = 'political'
             _audit(request.user, 'political', 'redirect', question)
+        note = _resolve_ask_note(request, data.get('note_id'))
+        session = prepare_session(request.user, data, note)
+        if session.note_id:
+            note = _resolve_ask_note(request, session.note_id)
+        question = data['question']
+
+        use_agent = agent_bridge.enabled()
+        if use_agent:
+            result = agent_bridge.answer(request.user, note, question)
+            answer, refs, followups = result['answer'], result['references'], result['followups']
         elif note is None:
             # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
             result = rag.answer_general(prep['rewrite'] or question)
@@ -359,8 +379,13 @@ class AskView(APIView):
             question_rewrite=prep['rewrite'],
             profile_updated=prep['profile_updated'],
             moderation=moderation_flag,
+        record = save_answer(session,
+            user=request.user, note=note, question=question,
+            answer=answer, references=refs, followups=followups,
         )
-        return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
+        response = Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
+        response['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
+        return response
 
 
 def _stream_followups(note: Note | None, question: str, answer: str) -> list[str]:
@@ -392,6 +417,9 @@ class AskStreamView(APIView):
     安全拦截时下发 blocked（违规）或按正常回答流下发引导 / 安全警告（moderation 标记随 done 带回）。
     真流式：向量召回后 qwen-plus 逐 token 生成；RAG 不可用时降级演示检索一次性下发；
     流中断时以已生成内容收尾（无引用），保证前端总能拿到 done 记录入库。
+    Agent 事件：status / delta / replace → done（已入库的完整问答记录）。
+    replace 覆盖临时答案，只有最终答案入库；保留通用问答及 session_ref。
+    AGENT_ENABLED=0 或缺少包/模型 key 时沿用旧 RAG 路径。
     """
 
     permission_classes = [IsAuthenticated]
@@ -465,11 +493,58 @@ class AskStreamView(APIView):
             )
             if extra.get('mode') == 'no_basis':
                 _upsert_gap(record)
+        session = prepare_session(request.user, data, note)
+        if session.note_id:
+            note = _resolve_ask_note(request, session.note_id)
+        question = data['question']
+        general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
+        use_agent = agent_bridge.enabled()
+
+        def sse():
+            if use_agent:
+                from contextlib import closing
+                with closing(agent_bridge.stream(request.user, note, question)) as events:
+                    for event in events:
+                        if event['event'] == 'done':
+                            record = save_answer(session,
+                                user=request.user, note=note, question=question,
+                                **event['data'],
+                            )
+                            yield _sse('done', QaRecordSerializer(record).data)
+                            return
+                        yield _sse(event['event'], event['data'])
+                return
+            buf, refs = '', []
+            try:
+                gen = rag.answer_stream_general(question) if general else rag.answer_stream(note, question)
+                for ev in gen:
+                    if ev['type'] == 'delta':
+                        buf += ev['text']
+                        yield _sse('delta', {'text': ev['text']})
+                    elif ev['type'] == 'end':
+                        refs = ev.get('refs') or []
+                        break
+                    else:  # error：已有增量则就地收尾，否则走演示降级
+                        break
+            except Exception:
+                pass  # 流中断：以已生成内容收尾
+            if not buf:
+                if general:
+                    buf = rag.no_general_answer()
+                    yield _sse('delta', {'text': buf})
+                else:
+                    buf, refs = demo_answer(note, question)
+                    yield _sse('delta', {'text': buf})
+            record = save_answer(session,
+                user=request.user, note=note, question=question,
+                answer=buf, references=refs, followups=_stream_followups(note, question, buf),
+                )
             yield _sse('done', QaRecordSerializer(record).data)
 
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')
         resp['Cache-Control'] = 'no-cache'
         resp['X-Accel-Buffering'] = 'no'
+        resp['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
         return resp
 
 
@@ -487,7 +562,7 @@ class QaListView(ListAPIView):
         # 按前端自由对话会话拉历史（刷新后恢复会话消息）
         session = (self.request.query_params.get('session') or '').strip()
         if session:
-            qs = qs.filter(session_ref=session)
+            qs = qs.filter(session_ref=session).order_by('created_at', 'id')
         keyword = (self.request.query_params.get('search') or '').strip()
         if keyword:
             qs = qs.filter(question__icontains=keyword)

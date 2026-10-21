@@ -32,8 +32,11 @@ urlpatterns = [
 ]
 
 # 提供用户上传的媒体文件（头像 / 材料 / 截图）
-# DEBUG=True 用 static()；生产（DEBUG=False）显式挂 serve，保证 /media 始终可用
-if settings.DEBUG:
+# OSS 模式只提供签名旧文件访问；local 模式保留原来的开发/部署行为。
+if settings.RAG_MEDIA_STORAGE == 'oss':
+    from .media_views import legacy_media
+    urlpatterns += [path('api/media/legacy/', legacy_media, name='legacy-media')]
+elif settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 else:
     from django.urls import re_path

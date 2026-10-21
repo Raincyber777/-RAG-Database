@@ -2,8 +2,11 @@
 from django.urls import path
 
 from . import views
+from .sessions import SessionListView, SessionDetailView
 
 urlpatterns = [
+    path('qa/sessions/', SessionListView.as_view()),
+    path('qa/sessions/<str:ref>/', SessionDetailView.as_view()),
     path('qa/', views.QaListView.as_view()),
     path('qa/ask/', views.AskView.as_view()),
     path('qa/ask/stream/', views.AskStreamView.as_view()),

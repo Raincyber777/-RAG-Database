@@ -22,6 +22,7 @@ from django.conf import settings
 log = logging.getLogger(__name__)
 
 from mysite import llm, rag
+from mysite.media_storage import local_material_path
 from notes.models import Note
 
 ASR_BASE = 'https://dashscope.aliyuncs.com'
@@ -327,7 +328,11 @@ def _extract(note: Note) -> tuple[str, str]:
     """按材料类型抽取内容，返回 (内容文本, 来源标签)"""
     if not note.source:
         raise UnsupportedSource('未上传材料文件')
-    path = note.source.path
+    with local_material_path(note.source) as path:
+        return _extract_path(note, path)
+
+
+def _extract_path(note: Note, path: str) -> tuple[str, str]:
     kind = note.source_type or 'audio'
     if kind in ('audio', 'video'):
         sentences = _asr_sentences(path)

@@ -1,5 +1,5 @@
 """问题反馈序列化器"""
-from django.conf import settings
+from django.core.files.storage import default_storage
 from rest_framework import serializers
 
 from .models import Feedback
@@ -19,8 +19,8 @@ class FeedbackSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         # 截图输出完整 URL（存储字段里是 media 相对路径）
         request = self.context.get('request')
-        if request is not None:
-            data['images'] = [request.build_absolute_uri(settings.MEDIA_URL + p) for p in data['images']]
+        urls = [default_storage.url(p) for p in data['images']]
+        data['images'] = [request.build_absolute_uri(url) for url in urls] if request else urls
         return data
 
 

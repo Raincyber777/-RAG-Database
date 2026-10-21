@@ -4,8 +4,24 @@
 QaRecord 即对话日志：除问答本体与引用外，还落召回片段（retrieval）、改写问题、
 审核标记（moderation）等进化原料；反馈埋点走 QaFeedback，训练样本走 TrainingSample。
 """
+import uuid
 from django.conf import settings
 from django.db import models
+
+
+class QaSession(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='qa_sessions')
+    ref = models.CharField(max_length=64, default=uuid.uuid4, unique=True)
+    title = models.CharField(max_length=200, default='新的对话')
+    note = models.ForeignKey('notes.Note', null=True, blank=True, on_delete=models.SET_NULL)
+    pinned = models.BooleanField(default=False)
+    pinned_at = models.DateTimeField(null=True, blank=True)
+    deleted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-pinned', '-pinned_at', '-updated_at', '-id']
 
 
 class QaRecord(models.Model):
@@ -18,6 +34,7 @@ class QaRecord(models.Model):
         on_delete=models.CASCADE, related_name='qa_records',
         null=True, blank=True,  # 通用问答（账号尚无已完成纪要，纯外部检索回答）为空
     )
+    session = models.ForeignKey(QaSession, null=True, blank=True, on_delete=models.CASCADE, related_name='records')
     question = models.TextField('问题')
     answer = models.TextField('回答')
     references = models.JSONField('引用来源', default=list, blank=True)  # [{label, time, note_title}]

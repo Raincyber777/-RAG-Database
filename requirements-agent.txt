@@ -1,0 +1,2 @@
+# Run from the backend repository root; bundled local Agent source.
+-e ./agent
