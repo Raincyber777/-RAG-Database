@@ -7,6 +7,7 @@
 """
 import hashlib
 import json
+from contextlib import closing
 
 from django.db.models import F, Q
 from django.db.models.functions import Greatest, Least
@@ -28,8 +29,6 @@ from safety.models import HealthProfile, SensitiveAuditLog
 from .models import KnowledgeGap, QaFeedback, QaRecord, TrainingSample
 from .serializers import (AskSerializer, KnowledgeGapSerializer, QaRecordSerializer,
                           TrainingSampleSerializer)
-from .models import QaRecord
-from .serializers import AskSerializer, QaRecordSerializer
 from . import agent_bridge
 from .sessions import prepare_session, save_answer
 
@@ -318,8 +317,13 @@ class AskView(APIView):
             return Response({'detail': prep['reject'], 'category': 'blocked'}, status=status.HTTP_400_BAD_REQUEST)
 
         note = _resolve_ask_note(request, data.get('note_id'))
+        session = prepare_session(request.user, data, note)
+        if session.note_id:
+            note = _resolve_ask_note(request, session.note_id)
         question = prep['question']
         moderation_flag = ''
+        use_agent = False
+        collect: dict = {}
 
         if 'health_block' in prep:
             answer, refs, followups = prep['health_block'], [], []
@@ -328,61 +332,46 @@ class AskView(APIView):
             answer, refs, followups = prep['moderate']['message'], [], []
             moderation_flag = 'political'
             _audit(request.user, 'political', 'redirect', question)
-        note = _resolve_ask_note(request, data.get('note_id'))
-        session = prepare_session(request.user, data, note)
-        if session.note_id:
-            note = _resolve_ask_note(request, session.note_id)
-        question = data['question']
-
-        use_agent = agent_bridge.enabled()
-        if use_agent:
-            result = agent_bridge.answer(request.user, note, question)
-            answer, refs, followups = result['answer'], result['references'], result['followups']
-        elif note is None:
-            # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
-            result = rag.answer_general(prep['rewrite'] or question)
-            if result is not None:
-                answer, refs, followups = result
-            else:
-                answer, refs, followups = rag.no_general_answer(), [], []
-            answer = _finish_answer(answer, question)
         else:
-            # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
-            collect: dict = {}
-            result = rag.answer_note(note, prep['rewrite'] or question, collect=collect)
-            if result is not None:
-                answer, refs, followups = result
+            # 自由对话（无纪要）固定走 legacy 通用联网检索：agent 的强项在课堂材料问答，
+            # 无纪要时其检索工具没有着落点，容易空转修正轮次（慢且可能落到轮次上限文案）。
+            use_agent = agent_bridge.enabled() and note is not None
+            if use_agent:
+                result = agent_bridge.answer(request.user, note, question)
+                answer, refs, followups = result['answer'], result['references'], result['followups']
+                tail = moderation.MEDICAL_DISCLAIMER
+                if moderation.health_advice_hit(question) and '不构成医疗建议' not in answer:
+                    answer += tail
+            elif note is None:
+                # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
+                result = rag.answer_general(prep['rewrite'] or question)
+                if result is not None:
+                    answer, refs, followups = result
+                else:
+                    answer, refs, followups = rag.no_general_answer(), [], []
+                answer = _finish_answer(answer, question)
             else:
-                answer, refs = demo_answer(note, question)
-                followups = []
-                collect = {}
-            answer = _finish_answer(answer, question)
+                # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
+                result = rag.answer_note(note, prep['rewrite'] or question, collect=collect)
+                if result is not None:
+                    answer, refs, followups = result
+                else:
+                    answer, refs = demo_answer(note, question)
+                    followups = []
+                    collect = {}
+                answer = _finish_answer(answer, question)
 
-            record = QaRecord.objects.create(
-                user=request.user, note=note, question=question,
-                answer=answer, references=refs, followups=followups,
-                session_ref=data.get('session_ref', ''),
-                question_rewrite=prep['rewrite'],
-                retrieval=collect.get('retrieval', []),
-                used_external=collect.get('used_external', False),
-                profile_updated=prep['profile_updated'],
-                moderation=moderation_flag,
-            )
-            if collect.get('mode') == 'no_basis':
-                _upsert_gap(record)
-            return Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
-
-        record = QaRecord.objects.create(
-            user=request.user, note=note, question=question,
-            answer=answer, references=refs, followups=followups,
-            session_ref=data.get('session_ref', ''),
-            question_rewrite=prep['rewrite'],
-            profile_updated=prep['profile_updated'],
-            moderation=moderation_flag,
         record = save_answer(session,
             user=request.user, note=note, question=question,
             answer=answer, references=refs, followups=followups,
+            question_rewrite=prep['rewrite'],
+            retrieval=collect.get('retrieval', []),
+            used_external=collect.get('used_external', False),
+            profile_updated=prep['profile_updated'],
+            moderation=moderation_flag,
         )
+        if collect.get('mode') == 'no_basis':
+            _upsert_gap(record)
         response = Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
         response['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
         return response
@@ -429,8 +418,13 @@ class AskStreamView(APIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         note = _resolve_ask_note(request, data.get('note_id'))
+        session = prepare_session(request.user, data, note)
+        if session.note_id:
+            note = _resolve_ask_note(request, session.note_id)
         general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
         user = request.user
+        # 自由对话（无纪要）固定走 legacy 通用联网检索：agent 无纪要时检索没有着落点，易空转轮次
+        use_agent = agent_bridge.enabled() and note is not None
 
         def sse():
             prep = _prepare_ask(user, data)
@@ -446,13 +440,30 @@ class AskStreamView(APIView):
             if 'health_block' in prep:
                 buf = prep['health_block']
                 moderation_flag = 'health_block'
-                refs = []
                 yield _sse('delta', {'text': buf})
             elif prep['moderate'].get('verdict') == 'redirect':
                 buf = prep['moderate']['message']
                 moderation_flag = 'political'
                 _audit(user, 'political', 'redirect', question)
                 yield _sse('delta', {'text': buf})
+            elif use_agent:
+                with closing(agent_bridge.stream(user, note, question)) as events:
+                    for event in events:
+                        if event['event'] == 'delta':
+                            buf += event['data'].get('text', '')
+                        elif event['event'] == 'replace':
+                            # 语义是「替换」：新一轮修正前 replace '' 清空，结束时 replace 权威全文
+                            buf = event['data'].get('text', '')
+                        elif event['event'] == 'done':
+                            extra = dict(event['data'])
+                            break
+                        yield _sse(event['event'], event['data'])
+                buf = extra.get('answer') or buf or agent_bridge.UNAVAILABLE
+                refs = extra.get('references') or []
+                tail = moderation.MEDICAL_DISCLAIMER
+                if moderation.health_advice_hit(question) and '不构成医疗建议' not in buf:
+                    buf += tail
+                    yield _sse('delta', {'text': tail})
             else:
                 try:
                     gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
@@ -480,11 +491,11 @@ class AskStreamView(APIView):
                     buf += tail
                     yield _sse('delta', {'text': tail})
 
-            record = QaRecord.objects.create(
+            followups = [] if moderation_flag else (
+                list(extra.get('followups') or []) or _stream_followups(note, question, buf))
+            record = save_answer(session,
                 user=user, note=note, question=question,
-                answer=buf, references=refs,
-                followups=[] if moderation_flag else _stream_followups(note, question, buf),
-                session_ref=data.get('session_ref', ''),
+                answer=buf, references=refs, followups=followups,
                 question_rewrite=prep['rewrite'],
                 retrieval=extra.get('retrieval', []),
                 used_external=extra.get('used_external', False),
@@ -493,52 +504,6 @@ class AskStreamView(APIView):
             )
             if extra.get('mode') == 'no_basis':
                 _upsert_gap(record)
-        session = prepare_session(request.user, data, note)
-        if session.note_id:
-            note = _resolve_ask_note(request, session.note_id)
-        question = data['question']
-        general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
-        use_agent = agent_bridge.enabled()
-
-        def sse():
-            if use_agent:
-                from contextlib import closing
-                with closing(agent_bridge.stream(request.user, note, question)) as events:
-                    for event in events:
-                        if event['event'] == 'done':
-                            record = save_answer(session,
-                                user=request.user, note=note, question=question,
-                                **event['data'],
-                            )
-                            yield _sse('done', QaRecordSerializer(record).data)
-                            return
-                        yield _sse(event['event'], event['data'])
-                return
-            buf, refs = '', []
-            try:
-                gen = rag.answer_stream_general(question) if general else rag.answer_stream(note, question)
-                for ev in gen:
-                    if ev['type'] == 'delta':
-                        buf += ev['text']
-                        yield _sse('delta', {'text': ev['text']})
-                    elif ev['type'] == 'end':
-                        refs = ev.get('refs') or []
-                        break
-                    else:  # error：已有增量则就地收尾，否则走演示降级
-                        break
-            except Exception:
-                pass  # 流中断：以已生成内容收尾
-            if not buf:
-                if general:
-                    buf = rag.no_general_answer()
-                    yield _sse('delta', {'text': buf})
-                else:
-                    buf, refs = demo_answer(note, question)
-                    yield _sse('delta', {'text': buf})
-            record = save_answer(session,
-                user=request.user, note=note, question=question,
-                answer=buf, references=refs, followups=_stream_followups(note, question, buf),
-                )
             yield _sse('done', QaRecordSerializer(record).data)
 
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')

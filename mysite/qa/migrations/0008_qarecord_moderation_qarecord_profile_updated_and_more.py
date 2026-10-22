@@ -9,7 +9,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('notes', '0003_notechunk_weight'),
-        ('qa', '0005_qarecord_session_ref'),
+        ('qa', '0007_backfill_sessions'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

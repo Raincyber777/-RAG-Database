@@ -11,42 +11,42 @@ class SessionTests(TestCase):
         self.client=APIClient(); self.client.force_authenticate(self.a)
 
     def create(self, title='new'):
-        r=self.client.post('/qa/sessions/',{'title':title},format='json')
+        r=self.client.post('/api/qa/sessions/',{'title':title},format='json')
         self.assertEqual(r.status_code,201)
         return r.data['ref']
 
     def test_directory_survives_new_client_login_and_can_be_renamed_pinned_deleted(self):
         ref=self.create('lesson')
-        self.assertEqual(self.client.patch(f'/qa/sessions/{ref}/',{'title':'renamed','pinned':True},format='json').status_code,200)
+        self.assertEqual(self.client.patch(f'/api/qa/sessions/{ref}/',{'title':'renamed','pinned':True},format='json').status_code,200)
         self.client=APIClient(); self.client.force_authenticate(self.a)
-        rows=self.client.get('/qa/sessions/').data
+        rows=self.client.get('/api/qa/sessions/').data
         if isinstance(rows,dict): rows=rows['results']
         self.assertEqual(rows[0]['title'],'renamed');self.assertTrue(rows[0]['pinned'])
-        self.assertEqual(self.client.delete(f'/qa/sessions/{ref}/').status_code,204)
-        self.assertEqual(self.client.get(f'/qa/sessions/{ref}/').status_code,404)
+        self.assertEqual(self.client.delete(f'/api/qa/sessions/{ref}/').status_code,204)
+        self.assertEqual(self.client.get(f'/api/qa/sessions/{ref}/').status_code,404)
 
     def test_other_user_cannot_read_edit_delete_or_submit_to_session(self):
         ref=self.create(); self.client.force_authenticate(self.b)
         for method in ['get','patch','delete']:
-            r=getattr(self.client,method)(f'/qa/sessions/{ref}/',{},format='json')
+            r=getattr(self.client,method)(f'/api/qa/sessions/{ref}/',{},format='json')
             self.assertEqual(r.status_code,404)
         with patch('qa.agent_bridge.answer') as answer:
-            r=self.client.post('/qa/ask/',{'session_ref':ref,'question':'x'},format='json')
+            r=self.client.post('/api/qa/ask/',{'session_ref':ref,'question':'x'},format='json')
             self.assertEqual(r.status_code,404);answer.assert_not_called()
 
     def test_answer_uses_session_and_history_is_separate_and_chronological(self):
         first=self.create(); second=self.create()
         with patch('qa.agent_bridge.enabled',return_value=True), patch('qa.agent_bridge.answer',return_value={'answer':'ok','references':[],'followups':[]}):
             for ref,q in [(first,'one'),(second,'other'),(first,'two')]:
-                response=self.client.post('/qa/ask/',{'session_ref':ref,'question':q},format='json')
+                response=self.client.post('/api/qa/ask/',{'session_ref':ref,'question':q},format='json')
                 self.assertEqual(response.status_code,201)
                 self.assertEqual(response.data['session_ref'],ref)
-        data=self.client.get('/qa/',{'session':first}).data
+        data=self.client.get('/api/qa/',{'session':first}).data
         if isinstance(data,dict): data=data['results']
         self.assertEqual([r['question'] for r in data],['one','two'])
-        self.client.delete(f'/qa/sessions/{first}/')
+        self.client.delete(f'/api/qa/sessions/{first}/')
         self.assertEqual(QaRecord.objects.count(),1)
-        self.assertEqual(self.client.post('/qa/ask/',{'session_ref':first,'question':'late'},format='json').status_code,404)
+        self.assertEqual(self.client.post('/api/qa/ask/',{'session_ref':first,'question':'late'},format='json').status_code,404)
 
     def test_migration_preserves_old_records_and_separates_users_and_refs(self):
         import importlib
@@ -73,7 +73,7 @@ class SessionTests(TestCase):
         from qa.sessions import save_answer
         from rest_framework.exceptions import NotFound
         ref=self.create(); session=QaSession.objects.get(ref=ref)
-        self.client.delete(f'/qa/sessions/{ref}/')
+        self.client.delete(f'/api/qa/sessions/{ref}/')
         with self.assertRaises(NotFound):
             save_answer(session,user=self.a,note=None,question='late',answer='late')
         self.assertEqual(QaRecord.objects.count(),0)
