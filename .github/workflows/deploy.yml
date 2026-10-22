@@ -73,6 +73,9 @@ jobs:
           umask 077
           cat > /tmp/rag-backend.env <<EOF
           DASHSCOPE_API_KEY=$DASHSCOPE_KEY
+          # agent 联网搜索走百炼自带检索（现有 key 即可用；如改用 Tavily 需同时加 TAVILY_API_KEY）
+          AGENT_SEARCH_PROVIDER=dashscope
+          AGENT_ENABLE_SEARCH=true
           RAG_DB_USER=rag_app
           RAG_DB_PASSWORD=$DB_PASSWORD
           DJANGO_DEBUG=False
