@@ -6,6 +6,9 @@
 #   Secrets（本仓库专用）：
 #     DASHSCOPE_API_KEY  百炼 API Key（值同本地 mysite/local_settings.py 里的）
 #     RAG_DB_PASSWORD    服务器 PostgreSQL 中 rag_app 账号的密码（首次建库时自定）
+#     TAVILY_API_KEY     Tavily 联网搜索 key（agent web_search 用；不配则自动回退百炼自带检索）
+#     OSS_BUCKET / OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET
+#                      私有 OSS 桶与 RAM 密钥（三个齐配才启用 OSS 存储，缺任一维持本地存储）
 #   Secrets（注册验证码通道，可选；不配置则该接收方式在前端自动隐藏）：
 #     RAG_EMAIL_USER / RAG_EMAIL_PASSWORD    发码邮箱账号与 SMTP 授权码（如 QQ 邮箱）
 #     RAG_SMS_ACCESS_KEY_ID / RAG_SMS_ACCESS_KEY_SECRET  阿里云 RAM AK/SK
@@ -50,6 +53,10 @@ jobs:
           SMS_KEY_SECRET: ${{ secrets.RAG_SMS_ACCESS_KEY_SECRET }}
           SMS_SIGN: ${{ secrets.RAG_SMS_SIGN_NAME }}
           SMS_TEMPLATE: ${{ secrets.RAG_SMS_TEMPLATE_CODE }}
+          TAVILY_KEY: ${{ secrets.TAVILY_API_KEY }}
+          OSS_BUCKET_NAME: ${{ secrets.OSS_BUCKET }}
+          OSS_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
         run: |
           if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
             echo "::error::未配置 secrets DEPLOY_HOST / DEPLOY_USER"
@@ -73,9 +80,19 @@ jobs:
           umask 077
           cat > /tmp/rag-backend.env <<EOF
           DASHSCOPE_API_KEY=$DASHSCOPE_KEY
-          # agent 联网搜索走百炼自带检索（现有 key 即可用；如改用 Tavily 需同时加 TAVILY_API_KEY）
-          AGENT_SEARCH_PROVIDER=dashscope
+          # agent 联网搜索：配了 TAVILY_API_KEY 即走 Tavily，未配则回退百炼自带检索（无需额外 key）
+          AGENT_SEARCH_PROVIDER=$([ -n "$TAVILY_KEY" ] && echo tavily || echo dashscope)
+          TAVILY_API_KEY=$TAVILY_KEY
           AGENT_ENABLE_SEARCH=true
+          # 私有 OSS 存储：三个 OSS secret 齐全即启用，缺任一维持本地存储（流程见 OSS_INTEGRATION.md）
+          RAG_MEDIA_STORAGE=$([ -n "$OSS_ID" ] && [ -n "$OSS_SECRET" ] && [ -n "$OSS_BUCKET_NAME" ] && echo oss || echo local)
+          OSS_ENDPOINT=https://oss-cn-beijing.aliyuncs.com
+          OSS_BUCKET=$OSS_BUCKET_NAME
+          OSS_ACCESS_KEY_ID=$OSS_ID
+          OSS_ACCESS_KEY_SECRET=$OSS_SECRET
+          OSS_PREFIX=classroom
+          OSS_URL_EXPIRE_SECONDS=900
+          OSS_CONNECT_TIMEOUT=30
           RAG_DB_USER=rag_app
           RAG_DB_PASSWORD=$DB_PASSWORD
           DJANGO_DEBUG=False
