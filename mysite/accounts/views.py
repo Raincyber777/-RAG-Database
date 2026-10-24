@@ -285,6 +285,30 @@ class AdminAccountResetPasswordView(APIView):
         return Response({'detail': f'已重置「{target.username}」的密码'})
 
 
+class AdminAccountBatchResetPasswordView(APIView):
+    """POST /api/admin/accounts/batch_reset_password/ —— 批量重置密码
+    body: {ids: [...], password}（统一初始密码，至少 8 位，后端校验强度）"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def post(self, request):
+        ser = ResetPasswordSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ids = request.data.get('ids')
+        if not isinstance(ids, list) or not ids:
+            return Response({'detail': '请先勾选要重置的账号'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            id_list = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return Response({'detail': '账号标识有误'}, status=status.HTTP_400_BAD_REQUEST)
+        updated = 0
+        for target in User.objects.filter(pk__in=id_list):
+            target.set_password(ser.validated_data['password'])
+            target.save(update_fields=['password'])
+            updated += 1
+        return Response({'detail': f'已重置 {updated} 个账号的密码', 'updated': updated})
+
+
 class AdminAccountToggleStatusView(APIView):
     """POST /api/admin/accounts/{id}/toggle_status/ —— 停用 / 恢复账号"""
 

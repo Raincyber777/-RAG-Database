@@ -56,6 +56,8 @@ class NoteChunk(models.Model):
     text = models.TextField('片段文本')
     ref = models.CharField('来源引用', max_length=100, blank=True, default='')  # 录音 / 板书 第3页 / 纪要定义…
     embedding = models.JSONField('向量', default=list, blank=True)
+    # 反馈权重：点赞/复制/停留久上调，点踩/重新提问下调；检索排序分 = 余弦 × weight（clamp 0.2~2.0）
+    weight = models.FloatField('反馈权重', default=1.0)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
 
     class Meta:

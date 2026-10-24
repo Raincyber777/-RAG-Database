@@ -15,6 +15,7 @@ def picture(name='board.png'):
 
 class ImageAskTests(TestCase):
     def setUp(self):
+        self.enterContext(patch('mysite.llm.chat_json', return_value=None))
         self.enterContext(override_settings(STORAGES={'default':{'BACKEND':'django.core.files.storage.InMemoryStorage'}}))
         self.user=User.objects.create_user(username='owner',email='o@test.invalid',phone='1')
         self.other=User.objects.create_user(username='other',email='b@test.invalid',phone='2')
@@ -133,3 +134,44 @@ class ImageAskTests(TestCase):
             'image_record_id': record.pk}, format='json')
         self.assertEqual(response.status_code, 503)
         self.assertIn('历史图片', str(response.data))
+
+    def test_image_question_keeps_moderation_block_in_both_endpoints(self):
+        with patch('qa.views.moderation.moderate', return_value={'verdict': 'block', 'message': 'blocked'}), \
+                patch('qa.images.vision_tokens') as vision:
+            sync = self.client.post('/qa/ask/', {'question': 'test', 'images': [picture()]}, format='multipart')
+            self.assertEqual(sync.status_code, 400)
+            events = self.events(self.ask(question='test', images=[picture()]))
+        self.assertEqual(events[-1][0], 'blocked')
+        vision.assert_not_called()
+        self.assertEqual(QaRecord.objects.count(), 0)
+
+    def test_health_gate_blocks_image_model_and_persists_metadata(self):
+        with patch('qa.views._health_gate', return_value=(True, 'health warning')), \
+                patch('qa.images.vision_tokens') as vision:
+            sync = self.client.post('/qa/ask/', {'question': 'test', 'images': [picture()]}, format='multipart')
+            self.assertEqual(sync.status_code, 201)
+            events = self.events(self.ask(question='test', images=[picture()]))
+        vision.assert_not_called()
+        for data in [sync.data, events[-1][1]]:
+            self.assertEqual(data['answer'], 'health warning')
+            self.assertEqual(data['moderation'], 'health_block')
+            self.assertTrue(data['profile_updated'])
+
+    def test_redirect_precedes_image_model(self):
+        with patch('qa.views.moderation.moderate', return_value={'verdict': 'redirect', 'message': 'redirect'}), \
+                patch('qa.images.vision_tokens') as vision:
+            events = self.events(self.ask(question='test', images=[picture()]))
+        vision.assert_not_called()
+        self.assertEqual(events[-1][1]['moderation'], 'political')
+        self.assertEqual(events[-1][1]['answer'], 'redirect')
+
+    def test_successful_vision_keeps_profile_flag_and_answer_suffix(self):
+        with patch('qa.views._health_gate', return_value=(True, '')), \
+                patch('qa.views.moderation.health_advice_hit', return_value=True), \
+                patch('qa.images.vision_tokens', side_effect=lambda *args: (x for x in ['answer'])):
+            events = self.events(self.ask(question='test', images=[picture()]))
+        payload = events[-1][1]
+        self.assertTrue(payload['profile_updated'])
+        self.assertIn('不构成医疗建议', payload['answer'])
+        self.assertEqual(payload['moderation'], '')
+        self.assertEqual(len(payload['attachments']), 1)

@@ -138,7 +138,7 @@ def cleanup_record_images(sender, instance, **kwargs):
     transaction.on_commit(lambda: delete_images(images))
 
 
-def image_events(session, user, note, question, images):
+def image_events(session, user, note, question, images, *, profile_updated=False, answer_suffix=''):
     from .serializers import QaRecordSerializer
     stored = []
     saved = False
@@ -156,9 +156,13 @@ def image_events(session, user, note, question, images):
         answer = ''.join(parts).strip()
         if not answer:
             raise RuntimeError('Empty vision answer')
+        if answer_suffix and '不构成医疗建议' not in answer:
+            answer += answer_suffix
+            yield 'delta', {'text': answer_suffix}
         with transaction.atomic():
             record = save_answer(session, user=user, note=note, question=question,
-                                 answer=answer, references=[], followups=[], images=stored)
+                                 answer=answer, references=[], followups=[], images=stored,
+                                 profile_updated=profile_updated)
             payload = QaRecordSerializer(record).data
         saved = True
         yield 'done', payload

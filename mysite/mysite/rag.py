@@ -26,6 +26,7 @@ MIN_SCORE = 0.05   # 相似度过低视为未召回（交给 LLM 说明依据不
 DOC_CHUNK_CHARS = 280   # 无时间戳文本（讲义）按该长度聚合分块，避免长文产生过多碎片段
 KB_STRONG = 0.42   # Top1 相似度 ≥ 该值：知识库足以回答，纯知识库作答
 KB_WEAK = 0.22     # KB_WEAK ~ KB_STRONG：知识库部分覆盖，融合外部知识补充
+WEIGHT_MIN, WEIGHT_MAX = 0.2, 2.0   # 片段反馈权重边界（qa.views 反馈闭环升降，此处只做检索端 clamp）
 
 
 def chunk_note(note: Note) -> list[dict]:
@@ -67,16 +68,19 @@ def chunk_note(note: Note) -> list[dict]:
 
 
 def index_note(note: Note) -> bool:
-    """重建一篇纪要的检索片段并向量化入库（全量替换）；key 未配置 / 向量化失败返回 False"""
+    """重建一篇纪要的检索片段并向量化入库（全量替换）；key 未配置 / 向量化失败返回 False。
+    反馈权重按片段文本继承到新片段（否则重新处理纪要会把反馈调出来的权重清零）。"""
     chunks = chunk_note(note)
     if not chunks:
         return False
     vecs = llm.embed([c['text'] for c in chunks])
     if vecs is None:
         return False
+    old_weights = dict(NoteChunk.objects.filter(note=note).values_list('text', 'weight'))
     NoteChunk.objects.filter(note=note).delete()
     NoteChunk.objects.bulk_create([
-        NoteChunk(note=note, seq=i, text=c['text'], ref=c['ref'], embedding=v)
+        NoteChunk(note=note, seq=i, text=c['text'], ref=c['ref'], embedding=v,
+                  weight=old_weights.get(c['text'], 1.0))
         for i, (c, v) in enumerate(zip(chunks, vecs))
     ])
     return True
@@ -91,7 +95,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def retrieve_scored(note: Note, question: str, k: int = TOP_K) -> list[tuple[NoteChunk, float]] | None:
-    """向量召回 Top-K 片段并携带相似度分（降序）；片段缺失时现算入库（懒加载），失败返回 None。
+    """向量召回 Top-K 片段并携带排序分（降序）；片段缺失时现算入库（懒加载），失败返回 None。
+    排序分 = 余弦相似度 × 反馈权重（weight clamp 到 [WEIGHT_MIN, WEIGHT_MAX]，避免异常值主导）。
     分数用于检索优先级分档：决定走「纯知识库」还是「知识库 + 外部补充」。"""
     chunks = list(NoteChunk.objects.filter(note=note))
     if not chunks and not index_note(note):
@@ -103,7 +108,12 @@ def retrieve_scored(note: Note, question: str, k: int = TOP_K) -> list[tuple[Not
     qvec = llm.embed([question])
     if qvec is None:
         return None
-    scored = [(c, _cosine(qvec[0], c.embedding)) for c in chunks if c.embedding]
+    scored = []
+    for c in chunks:
+        if not c.embedding:
+            continue
+        w = min(max(c.weight if c.weight > 0 else 1.0, WEIGHT_MIN), WEIGHT_MAX)
+        scored.append((c, _cosine(qvec[0], c.embedding) * w))
     if not scored:
         return None
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -216,7 +226,9 @@ _EXTERNAL_RULES = (
     '必须在句末注明「补充自外部知识」，一处都不能漏；'
     '3）外部资料仍不足以回答的部分，明确写「暂时无法确认」，不要编造。'
 )
-_JSON_OUT = ('最后给出 3 条学生最可能接着问的追问（每条不超过 16 字）。'
+_JSON_OUT = ('最后给出 3 条学生最可能接着问的追问（每条不超过 16 字），'
+             '只提围绕课程知识或刚才回答内容的问题，'
+             '不要提作业提交、成绩查询等本产品没有的功能。'
              '只输出 JSON：{"answer": "...", "followups": ["...", "...", "..."]}')
 _TEXT_OUT = '直接输出回答正文，不要输出 JSON。'
 
@@ -236,6 +248,34 @@ def no_general_answer() -> str:
     """通用模式下外部检索不可用 / 无可靠依据时的固定回答（明确说明，不编造）"""
     return ('暂时无法确认：外部检索未获得可靠依据，暂时回答不了这个问题。'
             '你可以换个问法再试，或先在「课堂纪要」上传课堂材料后针对课内内容提问。')
+
+
+# ---------- 产品使用类问题直答：上传材料 / 交作业 / 查成绩等，不进检索链路 ----------
+# 背景：这类问题问的是本产品的功能边界，外部检索搜不到可靠依据，直接给使用指引
+# 而不是「暂时无法确认」，避免追问 chips 点进去全是拒绝
+_USAGE_PAT = re.compile(
+    r'(?:怎么|如何|在哪|去哪)(?:提交|上传|交|导入|传)(?:作业|材料|课件|讲义|笔记|文件|录音|照片)'
+    r'|作业(?:截止|提交(?:时间|在哪)?|在哪交)|成绩怎么(?:算|计算|评|查)|怎么(?:查|看)成绩'
+    r'|怎么(?:生成|导出|下载)(?:纪要|笔记)|怎么(?:上传|导入)(?:课件|材料)'
+    r'|这个(?:产品|平台|软件|网站|助手)(?:能|可以|会)?(?:干|做)什么'
+    r'|(?:你|您)(?:都)?(?:能|会)(?:做|干)(?:什么|啥)|功能(?:介绍|有哪些|是什么)'
+    r'|怎么(?:出题|练习|复习|使用)|这是(?:什么|干嘛的)(?:软件|平台|产品|网站)?'
+)
+
+_PRODUCT_GUIDE = (
+    '先给你介绍一下「智学纪要」的用法～\n'
+    '① 在「课堂纪要」页上传课堂录音、课件照片或讲义，系统会自动转写并生成结构化纪要'
+    '（课程主题 / 核心知识点 / 重要定义与公式 / 重点问题）；\n'
+    '② 回到「智能问答」，选中对应课堂即可针对课内内容提问，回答会标注引用与录音时间戳；'
+    '没有纪要时，我也可以结合全网资料回答并标注来源；\n'
+    '③ 「自创题练习」能用纪要自动出题，答错的题会自动收进错题本方便复习。\n'
+    '作业提交与成绩管理不在本产品范围内，请在学校指定的平台完成；课程内容上的问题随时问我！'
+)
+
+
+def _usage_reply(question: str) -> str | None:
+    """产品使用类问题直答（命中返回固定指引，不进检索链路）。"""
+    return _PRODUCT_GUIDE if _USAGE_PAT.search(question) else None
 
 
 # ---------- 日常对话直答：寒暄 / 问身份 / 闲聊等无需事实依据的输入，不进检索链路 ----------
@@ -292,6 +332,9 @@ def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
         reply = _chat_reply(question) if _looks_chitchat(question) else None
         if reply:
             return reply, [], []
+        usage = _usage_reply(question)
+        if usage:
+            return usage, [], []
         findings = _pick_findings(question)
         if not findings:
             # 检索一无所获再补一次对话判定：漏网寒暄（「在吗？」）不硬拒
@@ -329,6 +372,11 @@ def answer_stream_general(question: str):
         reply = _chat_reply(question) if _looks_chitchat(question) else None
         if reply:
             yield {'type': 'delta', 'text': reply}
+            yield {'type': 'end', 'refs': []}
+            return
+        usage = _usage_reply(question)
+        if usage:
+            yield {'type': 'delta', 'text': usage}
             yield {'type': 'end', 'refs': []}
             return
         findings = _pick_findings(question)
@@ -373,7 +421,17 @@ def _system(rules: str, stream: bool) -> str:
     return rules + (_TEXT_OUT if stream else _JSON_OUT)
 
 
-def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] | None:
+def _collect(scored: list | None, used_external: bool, mode: str) -> dict:
+    """检索过程回执：召回片段（含 chunk_id 与排序分）/ 是否用了外部知识 / 命中档位。
+    调用方（qa.views）落库到 QaRecord.retrieval，供反馈闭环升降片段权重。"""
+    return {
+        'retrieval': [{'chunk_id': c.id, 'score': round(s, 4), 'ref': c.ref} for c, s in (scored or [])],
+        'used_external': used_external,
+        'mode': mode,
+    }
+
+
+def answer_note(note: Note, question: str, collect: dict | None = None) -> tuple[str, list[dict], list[str]] | None:
     """
     完整 RAG 问答（知识库优先 + 外部知识补充）：
     向量召回分档 → qwen-plus 生成（JSON：answer + followups）→ 引用对齐 + 来源说明。
@@ -386,6 +444,11 @@ def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] 
         reply = _chat_reply(question) if _looks_chitchat(question) else None
         if reply:
             return reply, [], []
+        usage = _usage_reply(question)
+        if usage:
+            if collect is not None:
+                collect.update(_collect([], False, 'usage'))
+            return usage, [], []
         scored = retrieve_scored(note, question)
         if not scored and not llm.available():
             return None
@@ -399,6 +462,8 @@ def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] 
                 reply = _chat_reply(question)
                 if reply:
                     return reply, [], []
+                if collect is not None:
+                    collect.update(_collect(scored, False, 'no_basis'))
                 answer = _no_basis_answer(note)
                 return answer, [], []
             mode, rules = 'external', _EXTERNAL_RULES
@@ -408,6 +473,8 @@ def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] 
             mode, rules = 'fusion', _FUSION_RULES
         else:   # 弱相关且外部检索失败：仍按知识库回答（模型会说明依据不足）
             mode, rules = 'kb', _KB_RULES
+        if collect is not None:
+            collect.update(_collect(scored, mode in ('fusion', 'external'), mode))
         system = _system(rules, stream=False)
 
         kb_ctx = _kb_context(top)
@@ -447,7 +514,8 @@ def answer_note(note: Note, question: str) -> tuple[str, list[dict], list[str]] 
 
 def answer_stream(note: Note, question: str):
     """流式 RAG 问答生成器（知识库优先 + 外部知识补充）：向量召回分档 → 流式生成，供 SSE 逐段下发。
-    事件：{'type': 'delta', 'text'} 增量 → {'type': 'end', 'refs': [...]}（引用含 kind/url，末尾补来源说明）；
+    事件：{'type': 'delta', 'text'} 增量 → {'type': 'end', 'refs': [...]}（引用含 kind/url，
+    并带 retrieval/used_external/mode 检索回执，供调用方落库进化）；
     基础设施失败 / 流异常 yield {'type': 'error'}，由调用方降级演示检索。
     """
     try:
@@ -455,6 +523,11 @@ def answer_stream(note: Note, question: str):
         if reply:
             yield {'type': 'delta', 'text': reply}
             yield {'type': 'end', 'refs': []}
+            return
+        usage = _usage_reply(question)
+        if usage:
+            yield {'type': 'delta', 'text': usage}
+            yield {'type': 'end', 'refs': [], **_collect([], False, 'usage')}
             return
         scored = retrieve_scored(note, question)
         if not scored and not llm.available():
@@ -471,7 +544,7 @@ def answer_stream(note: Note, question: str):
                 if not reply:
                     reply = _no_basis_answer(note)
                 yield {'type': 'delta', 'text': reply}
-                yield {'type': 'end', 'refs': []}
+                yield {'type': 'end', 'refs': [], **_collect(scored, False, 'no_basis')}
                 return
             mode, rules = 'external', _EXTERNAL_RULES
         elif best >= KB_STRONG:
@@ -520,6 +593,6 @@ def answer_stream(note: Note, question: str):
             tail = '\n\n—— 来源说明 ——\n' + _source_line(refs)
             buf += tail
             yield {'type': 'delta', 'text': tail}
-        yield {'type': 'end', 'refs': refs}
+        yield {'type': 'end', 'refs': refs, **_collect(scored, mode in ('fusion', 'external'), mode)}
     except Exception:
         yield {'type': 'error'}

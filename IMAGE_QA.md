@@ -31,9 +31,13 @@ python mysite/manage.py migrate
 
 再重启后端服务并发布新前端。反向代理上传限制应大于 40MB（例如 `client_max_body_size 50m`）；SSE 保持禁用缓冲并留足模型响应超时；使用本地存储时应正确提供 `/media/`，使用 OSS 时浏览器需要能访问返回的签名 HTTPS 地址。
 
-### 与线上迁移合并
+### 已合并的数据库迁移
 
-本地当前迁移基线为 `0007_backfill_sessions`，本次新增 `0008_qarecord_images`。如果线上已有另一份 `qa/0008_*`，需要保留两边迁移文件，先检查各自操作；若为独立字段变更，可在合并代码后通过 `python mysite/manage.py makemigrations qa --merge` 生成合并迁移、检查后提交，再执行 migrate。不要覆盖线上迁移，不要用 `--fake` 掩盖冲突。如果线上 `0008` 已添加同名字段，需按真实迁移内容调整，不能直接合并重复 AddField。
+两份历史迁移均保留：`0008_qarecord_images` 添加图片字段，`0008_qarecord_moderation_qarecord_profile_updated_and_more` 添加审核、反馈、训练样本等字段和表。新增 `0009_merge_images_and_moderation` 依赖两者，没有额外数据库操作。
+
+线上已经执行其中一份 0008 时，`migrate` 会补齐另一份并记录 0009；本地同理。无需删除、改名或 fake 任何已有迁移。上传时必须包含新增的 0009 文件。
+
+图片提问同样经过现有文字审核与健康门禁，通过后才调用视觉模型；返回并保存健康档案更新标记，健康建议按现有逻辑追加提示。图片像素本身的理解由视觉模型完成，未新增独立图像内容审核服务。
 
 ## 验证
 

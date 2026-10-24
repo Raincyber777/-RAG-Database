@@ -1,7 +1,7 @@
 """Isolated integration tests: no local secrets, production DB or external services."""
 SECRET_KEY = 'offline-agent-integration-test-only'
 INSTALLED_APPS = ['django.contrib.auth', 'django.contrib.contenttypes', 'rest_framework',
-                  'accounts', 'notes', 'qa']
+                  'accounts', 'notes', 'qa', 'safety']
 DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}}
 AUTH_USER_MODEL = 'accounts.User'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

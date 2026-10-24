@@ -84,6 +84,7 @@ INSTALLED_APPS = [
     'feedback',
     'faq',
     'announcements',
+    'safety',
 ]
 
 MIDDLEWARE = [

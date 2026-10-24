@@ -74,6 +74,7 @@ class Gateway:
 
 class AgentIntegrationTests(TransactionTestCase):
     def setUp(self):
+        self.enterContext(patch('mysite.llm.chat_json', return_value=None))
         self.user = User.objects.create_user(username='alice', email='a@test.invalid', phone='1')
         self.other = User.objects.create_user(username='bob', email='b@test.invalid', phone='2')
         self.note = Note.objects.create(uploader=self.user, title='导数', course='数学', status='done',
@@ -268,16 +269,18 @@ class AgentIntegrationTests(TransactionTestCase):
         self.assertEqual(config.search_provider, 'tavily')
         self.assertEqual(config.api_key, 'offline-only')
 
-    def test_general_qa_without_notes_uses_agent_and_keeps_session_ref(self):
+    def test_general_qa_without_notes_uses_legacy_and_keeps_session_ref(self):
         self.note.delete()
         self.gateway.search = lambda question: None
-        with patch('mysite.rag.answer_general', side_effect=AssertionError('legacy general used')):
+        with patch('mysite.rag.answer_general', return_value=('通用回答', [], [])) as general:
             response = self.ask(note_id=None, session_ref='qa-general')
+        general.assert_called_once_with('什么是导数？')
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response['X-QA-Engine'], 'agent')
+        self.assertEqual(response['X-QA-Engine'], 'legacy')
+        self.assertEqual(response.data['answer'], '通用回答')
         self.assertIsNone(response.data['note'])
         self.assertEqual(QaRecord.objects.get().session_ref, 'qa-general')
-        self.assertEqual(len(self.builds), 1)
+        self.assertEqual(len(self.builds), 0)
         self.embedding.assert_not_called()
 
     def test_stream_preserves_session_ref(self):
@@ -288,7 +291,14 @@ class AgentIntegrationTests(TransactionTestCase):
     def test_general_stream_has_nullable_note_and_done(self):
         self.note.delete()
         self.gateway.search = lambda question: None
-        events = self.events(self.ask(stream=True, note_id=None, session_ref='qa-general'))
+        with patch('mysite.rag.answer_stream_general', return_value=iter([
+                {'type': 'delta', 'text': '通用流式回答'}, {'type': 'end', 'refs': []}])) as general:
+            response = self.ask(stream=True, note_id=None, session_ref='qa-general')
+            self.assertEqual(response['X-QA-Engine'], 'legacy')
+            events = self.events(response)
+        general.assert_called_once_with('什么是导数？')
+        self.assertEqual(len(self.builds), 0)
+        self.assertEqual(events[-1][1]['answer'], '通用流式回答')
         self.assertEqual(events[-1][0], 'done')
         self.assertIsNone(events[-1][1]['note'])
         self.assertEqual(events[-1][1]['session_ref'], 'qa-general')
