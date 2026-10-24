@@ -22,6 +22,7 @@ from .models import QaRecord
 from .serializers import AskSerializer, QaRecordSerializer
 from . import agent_bridge
 from .sessions import prepare_session, save_answer
+from .images import prepare_images, image_events
 
 
 def _score(question: str, text: str) -> int:
@@ -188,6 +189,16 @@ class AskView(APIView):
         if session.note_id:
             note = _resolve_ask_note(request, session.note_id)
         question = data['question']
+        images = prepare_images(data, session, request.user)
+        if images:
+            for event, payload in image_events(session, request.user, note, question, images):
+                if event == 'done':
+                    response = Response(payload, status=status.HTTP_201_CREATED)
+                    response['X-QA-Engine'] = 'vision'
+                    return response
+                if event == 'error':
+                    return Response(payload, status=status.HTTP_502_BAD_GATEWAY)
+
 
         use_agent = agent_bridge.enabled()
         if use_agent:
@@ -256,6 +267,18 @@ class AskStreamView(APIView):
         if session.note_id:
             note = _resolve_ask_note(request, session.note_id)
         question = data['question']
+        images = prepare_images(data, session, request.user)
+        if images:
+            def vision_sse():
+                from contextlib import closing
+                with closing(image_events(session, request.user, note, question, images)) as events:
+                    for event, payload in events:
+                        yield _sse(event, payload)
+            response = StreamingHttpResponse(vision_sse(), content_type='text/event-stream')
+            response['Cache-Control'] = 'no-cache'
+            response['X-Accel-Buffering'] = 'no'
+            response['X-QA-Engine'] = 'vision'
+            return response
         general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
         use_agent = agent_bridge.enabled()
 

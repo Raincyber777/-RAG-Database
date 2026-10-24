@@ -37,6 +37,7 @@ class QaRecord(models.Model):
     session = models.ForeignKey(QaSession, null=True, blank=True, on_delete=models.CASCADE, related_name='records')
     question = models.TextField('问题')
     answer = models.TextField('回答')
+    images = models.JSONField(default=list, blank=True)  # private storage paths, never signed URLs
     references = models.JSONField('引用来源', default=list, blank=True)  # [{label, time, note_title}]
     followups = models.JSONField('追问建议', default=list, blank=True)  # [str] 回答下方可点击的追问
     # 前端自由对话的会话标识（'qa'+时间戳）：刷新后按会话拉回历史；课内追问走 note 关联，此字段留空
