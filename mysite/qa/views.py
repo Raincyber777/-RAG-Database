@@ -407,7 +407,8 @@ class AskView(APIView):
             # 自由对话（无纪要）与寒暄闲聊固定走 legacy 通用联网检索：agent 的强项在课堂材料问答，
             # 无纪要/无证据可引用时其检索与校验容易空转修正轮次（慢且可能落到轮次上限文案）。
             use_agent = (not images and note is not None and agent_bridge.enabled()
-                         and not prep.get('chitchat'))
+                         and not prep.get('chitchat')
+                         and (data.get('note_id') is not None or session.note_id))
             if use_agent:
                 result = agent_bridge.answer(request.user, note, question)
                 answer, refs, followups = result['answer'], result['references'], result['followups']
@@ -499,8 +500,11 @@ class AskStreamView(APIView):
         # 引擎路由在 sse() 内 _prepare_ask 之后最终决定（改写步骤会判定寒暄闲聊）；
         # 下面先用零成本正则快判预置，供响应头在流开始前引用
         question_text = str(data.get('question') or '')
+        # agent 只服务「显式绑定纪要」的会话：自由对话即便被 _resolve_ask_note 兜底到
+        # 最新纪要，也不让 agent 接管——无目标纪要的常规问题会空转烧预算（线上实测）
+        explicit_note = data.get('note_id') is not None or bool(session.note_id)
         # 流前响应头用预判：元问题也要算进 legacy，避免头标 agent 实跑 legacy
-        general = (note is None or is_chitchat(question_text)
+        general = (not explicit_note or is_chitchat(question_text)
                    or is_meta_question(question_text))
         use_agent = not images and not general and agent_bridge.enabled()
 
@@ -513,7 +517,8 @@ class AskStreamView(APIView):
             question = prep['question']
             rag_question = prep['rewrite'] or question
             general = note is None or bool(prep.get('chitchat'))
-            use_agent = not images and not general and agent_bridge.enabled()
+            use_agent = (not images and explicit_note and not general
+                         and agent_bridge.enabled())
             buf, refs = '', []
             extra: dict = {}
             moderation_flag = ''

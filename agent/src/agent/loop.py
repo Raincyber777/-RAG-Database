@@ -44,7 +44,8 @@ def _clean_draft(text):
 def _degraded(draft, followups=None, fallback=None):
     """校验未完成时保留已流式显示的草稿并附免责说明；草稿为空才回退报错文案。"""
     body = _clean_draft(draft or '')
-    if not body:
+    if not body or body.startswith('暂时无法确认'):
+        # 模型按指示自弃（写了「暂时无法确认」）：套免责注反而观感怪异，给标准文案
         return fallback or unavailable()
     return {'answer': body + _DEGRADED_NOTE, 'sources': [], 'followups': followups or [],
             'mode': 'unavailable', 'degraded': True}
@@ -131,8 +132,10 @@ def build_middleware(max_model_calls):
         except (ValueError, TypeError, KeyError):
             return {'messages': [SystemMessage(content=(
                 '最终回答未通过校验。请先检索并用 filter_evidence 保留有依据的来源，再修正回答；'
-                '只能引用本轮保留的编号，每项结论带引用，不输出 URL。'
-                '输出 JSON {"answer":"正文","followups":[]}；无依据只写暂时无法确认。'
+                '课堂纪要查不到就换关键词调用 web_search 检索外部资料，外部结论用 [E编号] 引用'
+                '并在句尾注明「补充自外部知识」；只能引用本轮保留的编号，每项结论带引用，'
+                '不输出 URL。输出 JSON {"answer":"正文","followups":[]}；'
+                '课堂与外部都确实查不到依据才写暂时无法确认。'
                 '其他任务须先执行工具并审阅结果，然后输出 {"task_result":true}。'))], 'jump_to': 'model'}
 
     return [budget, validate]
