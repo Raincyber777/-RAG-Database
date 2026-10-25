@@ -498,7 +498,10 @@ class AskStreamView(APIView):
         user = request.user
         # 引擎路由在 sse() 内 _prepare_ask 之后最终决定（改写步骤会判定寒暄闲聊）；
         # 下面先用零成本正则快判预置，供响应头在流开始前引用
-        general = note is None or is_chitchat(str(data.get('question') or ''))
+        question_text = str(data.get('question') or '')
+        # 流前响应头用预判：元问题也要算进 legacy，避免头标 agent 实跑 legacy
+        general = (note is None or is_chitchat(question_text)
+                   or is_meta_question(question_text))
         use_agent = not images and not general and agent_bridge.enabled()
 
         def sse():
