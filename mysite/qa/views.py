@@ -81,10 +81,37 @@ CHITCHAT_RE = re.compile(
     r'|谢谢|多谢|辛苦了|麻烦了|再见|拜拜|测试|test|ping'
 )
 
+# 「问助手自己/产品功能」的元问题：课程笔记里永远找不到可引用的证据，
+# 进 agent 只会烧光轮次预算后报错，同样路由 legacy 通用问答。
+META_RE = re.compile(
+    r'上下文(?:长度|能力|窗口|限制)|几轮|多少轮|多轮对话'
+    r'|外[部来](?:知识|资料)|联网|实时搜索|上网搜'
+    r'|你的(?:名字|功能|能力|作者|开发者|模型|版本)'
+    r'|(?:能|可以|支持|会)(?:帮我)?(?:上传|生成|识别|解析|导出|下载)'
+    r'|(?:生成|制作)(?:学习)?纪要|纪要功能'
+    r'|^如何上传|^怎么上传'
+)
+
+GREETING_PREFIX_RE = re.compile(
+    r'^(?:你好|您好|哈喽|哈罗|嗨|[Hh]i|hello|hey)[，,。.~！!？?\s]+'
+)
+
 
 def is_chitchat(question: str) -> bool:
+    """寒暄快判（仅 ≤16 字短句）：问候语带正题前缀时（如「你好，索引怎么建」）
+    先剥前缀再判，避免把正经课程问题误当闲聊。"""
     text = (question or '').strip()
-    return bool(text) and len(text) <= 16 and bool(CHITCHAT_RE.search(text))
+    if not text or len(text) > 16:
+        return False
+    stripped = GREETING_PREFIX_RE.sub('', text)
+    if stripped != text:
+        return not stripped.strip() or bool(CHITCHAT_RE.search(stripped))
+    return bool(CHITCHAT_RE.search(text))
+
+
+def is_meta_question(question: str) -> bool:
+    text = (question or '').strip()
+    return bool(text) and len(text) <= 16 and bool(META_RE.search(text))
 
 
 def _rewrite_question(user, session_ref: str, question: str) -> tuple[str, bool]:
@@ -101,8 +128,10 @@ def _rewrite_question(user, session_ref: str, question: str) -> tuple[str, bool]
     data = llm.chat_json(
         [{'role': 'system', 'content': (
             '根据最近的对话上下文，把学生这条新消息改写成一个不依赖上下文、独立完整的问题。'
-            '消息本身已经完整时原样保留。同时判断这条消息是否为与课程学习无关的寒暄闲聊'
-            '（问候、玩笑、闲聊意愿、致谢告别、纯生活闲聊等）。只输出 JSON：'
+            '消息本身已经完整时原样保留。同时判断这条消息是否「与课程学习无关」：'
+            '寒暄闲聊（问候、玩笑、致谢告别、纯生活闲聊），或询问助手自身/产品功能而非课程'
+            '内容（如能否引用外部资料、支持几轮对话、上下文多长、能否生成纪要、如何上传文档'
+            '等），这两类都算 chitchat。只输出 JSON：'
             '{"question": "...", "chitchat": true|false}')},
          {'role': 'user', 'content': f'最近对话：\n{context}\n\n学生新消息：{question}'}],
         model=llm.MODEL_LITE, temperature=0.1, timeout=4,
@@ -157,6 +186,8 @@ def _prepare_ask(user, data: dict) -> dict:
         rewrite, chitchat = _rewrite_question(user, data.get('session_ref', ''), question)
     if not chitchat and is_chitchat(question):
         chitchat = True
+    if not chitchat and not rewrite and is_meta_question(question):
+        chitchat = True  # 元问题仅在改写未跑成时兜底：有 flash 判定时以它为准
     return {
         'question': question,
         'moderate': verdict,

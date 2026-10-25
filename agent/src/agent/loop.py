@@ -31,6 +31,35 @@ def unavailable(reason='资料不足，暂时无法确认。请补充材料或�
     return {'answer': reason, 'sources': [], 'followups': [], 'mode': 'unavailable', 'degraded': True}
 
 
+_DEGRADED_NOTE = '\n\n（注：以上内容未能完成全部来源校验，仅供参考。）'
+
+
+def _clean_draft(text):
+    """未校验草稿先去掉 URL 与「来源：」尾注——校验禁止外流的内容不随降级答案输出。"""
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'^.*(来源|参考)[:：].*$', '', text, flags=re.MULTILINE)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
+def _degraded(draft, followups=None, fallback=None):
+    """校验未完成时保留已流式显示的草稿并附免责说明；草稿为空才回退报错文案。"""
+    body = _clean_draft(draft or '')
+    if not body:
+        return fallback or unavailable()
+    return {'answer': body + _DEGRADED_NOTE, 'sources': [], 'followups': followups or [],
+            'mode': 'unavailable', 'degraded': True}
+
+
+def _degraded_from_state(state, fallback=None):
+    """取本轮最近一次（不带工具调用）的模型草稿用于降级输出。"""
+    for message in reversed(state.get('messages') or []):
+        if getattr(message, 'tool_calls', None):
+            continue
+        if message.type == 'ai':
+            return _degraded(streamed_answer_prefix(message.content), fallback=fallback)
+    return fallback or unavailable()
+
+
 def task_result(state):
     """A model may select a task artifact, but cannot fabricate the artifact itself."""
     for message in reversed(state['messages']):
@@ -63,7 +92,9 @@ def validate_final(state, content):
     if text is None:
         raise ValueError('每项结论必须引用真实证据，不能编造 URL 或来源说明')
     if not labels:
-        return unavailable()  # Model's unsupported prose is never accepted as fact.
+        # Model's unsupported prose is never accepted as fact — but it was already
+        # streamed, so keep it with a caveat instead of erasing it with an error.
+        return _degraded(answer.answer, _short_questions(answer.followups, 3, 16, []))
     mode = 'fusion' if any(x.startswith('E') for x in labels) and any(not x.startswith('E') for x in labels) else 'external' if all(x.startswith('E') for x in labels) else 'kb'
     return StudyService._finish_answer(text, _short_questions(answer.followups, 3, 16, []), mode, chunks, findings)
 
@@ -73,7 +104,8 @@ def build_middleware(max_model_calls):
     def budget(state, runtime):
         count = state.get('turn_model_calls', 0)
         if count >= max_model_calls:
-            return {'final_output': unavailable('暂时无法确认：已达到本次检索与修正轮次上限，请缩小问题范围后重试。'), 'jump_to': 'end'}
+            return {'final_output': _degraded_from_state(state, unavailable(
+                '暂时无法确认：已达到本次检索与修正轮次上限，请缩小问题范围后重试。')), 'jump_to': 'end'}
         # This status is public progress, not the model's hidden reasoning.
         get_stream_writer()({'event': 'status', 'data': {'stage': 'reasoning', 'round': count + 1}})
         return {'turn_model_calls': count + 1, 'model_call_count': state.get('model_call_count', 0) + 1}
