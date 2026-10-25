@@ -7,6 +7,7 @@
 """
 import hashlib
 import json
+import re
 from contextlib import closing
 
 from django.db.models import F, Q
@@ -71,27 +72,46 @@ def _audit(user, kind: str, action: str, question: str, detail: list | None = No
         pass  # 审计失败不影响问答主链路
 
 
-def _rewrite_question(user, session_ref: str, question: str) -> str:
+# 寒暄/闲聊快判（零成本正则）：这类消息进 agent 只会因「每句必须带引用」的证据校验
+# 反复打回，烧完 8 轮模型预算后以「轮次上限」替换掉已经流出的回答。
+CHITCHAT_RE = re.compile(
+    r'你好|您好|哈喽|哈罗|嗨|[Hh]i|hello|hey|在吗|在不在|早上好|中午好|下午好|晚上好|晚安'
+    r'|你是谁|你叫什么|机器人|人工智能|你是ai|你是吗'
+    r'|笑话|开玩笑|逗我|聊聊天|陪我聊|聊天吗|说句话'
+    r'|谢谢|多谢|辛苦了|麻烦了|再见|拜拜|测试|test|ping'
+)
+
+
+def is_chitchat(question: str) -> bool:
+    text = (question or '').strip()
+    return bool(text) and len(text) <= 16 and bool(CHITCHAT_RE.search(text))
+
+
+def _rewrite_question(user, session_ref: str, question: str) -> tuple[str, bool]:
     """会话内追问改写：结合本会话最近两轮把「那第二种呢？」改写成独立完整的问题，
-    检索与生成都用改写结果；无历史 / 超时 / 失败一律回退原文。"""
+    检索与生成都用改写结果；同时判定是否为与学习无关的寒暄闲聊（供引擎路由，
+    闲聊走 legacy 通用问答）。无历史 / 超时 / 失败一律回退 (原文, False)。"""
     if not session_ref:
-        return ''
+        return '', False
     prior = list(QaRecord.objects.filter(user=user, session_ref=session_ref)
                  .order_by('-created_at').values('question', 'answer')[:2])
     if not prior:
-        return ''
+        return '', False
     context = '\n'.join(f'问：{p["question"]}\n答（节选）：{p["answer"][:120]}' for p in reversed(prior))
     data = llm.chat_json(
         [{'role': 'system', 'content': (
             '根据最近的对话上下文，把学生这条新消息改写成一个不依赖上下文、独立完整的问题。'
-            '消息本身已经完整时原样保留。只输出 JSON：{"question": "..."}')},
+            '消息本身已经完整时原样保留。同时判断这条消息是否为与课程学习无关的寒暄闲聊'
+            '（问候、玩笑、闲聊意愿、致谢告别、纯生活闲聊等）。只输出 JSON：'
+            '{"question": "...", "chitchat": true|false}')},
          {'role': 'user', 'content': f'最近对话：\n{context}\n\n学生新消息：{question}'}],
         model=llm.MODEL_LITE, temperature=0.1, timeout=4,
     )
     if not isinstance(data, dict):
-        return ''
+        return '', False
     rewritten = str(data.get('question') or '').strip()
-    return rewritten[:500] if 2 <= len(rewritten) <= 300 else ''
+    rewrite = rewritten[:500] if 2 <= len(rewritten) <= 300 else ''
+    return rewrite, bool(data.get('chitchat'))
 
 
 def _health_gate(user, question: str) -> tuple[bool, str]:
@@ -119,8 +139,8 @@ def _health_gate(user, question: str) -> tuple[bool, str]:
 
 
 def _prepare_ask(user, data: dict) -> dict:
-    """提问前置三步：内容审核 → 健康门禁 → 会话改写。
-    返回 {'reject': msg} / {'health_block': msg} / 正常 {'question', 'rewrite', 'profile_updated'}。
+    """提问前置三步：内容审核 → 健康门禁 → 会话改写（含闲聊判定）。
+    返回 {'reject': msg} / {'health_block': msg} / 正常 {'question', 'rewrite', 'chitchat', 'profile_updated'}。
     政治引导不在这里拦（作为正常回答流下发），由调用方按 moderate 结果处理。"""
     question = data['question']
     verdict = moderation.moderate(question)
@@ -131,12 +151,18 @@ def _prepare_ask(user, data: dict) -> dict:
     if blocked:
         return {'health_block': blocked, 'question': question, 'rewrite': '',
                 'profile_updated': profile_updated, 'moderate': verdict}
+    if data.get('images') or data.get('image_record_id'):
+        rewrite, chitchat = '', False
+    else:
+        rewrite, chitchat = _rewrite_question(user, data.get('session_ref', ''), question)
+    if not chitchat and is_chitchat(question):
+        chitchat = True
     return {
         'question': question,
         'moderate': verdict,
-        'rewrite': '' if data.get('images') or data.get('image_record_id') else
-                   _rewrite_question(user, data.get('session_ref', ''), question),
+        'rewrite': rewrite,
         'profile_updated': profile_updated,
+        'chitchat': chitchat,
     }
 
 
@@ -347,17 +373,19 @@ class AskView(APIView):
                     if event == 'error':
                         return Response(payload, status=status.HTTP_502_BAD_GATEWAY)
         else:
-            # 自由对话（无纪要）固定走 legacy 通用联网检索：agent 的强项在课堂材料问答，
-            # 无纪要时其检索工具没有着落点，容易空转修正轮次（慢且可能落到轮次上限文案）。
-            use_agent = not images and note is not None and agent_bridge.enabled()
+            # 自由对话（无纪要）与寒暄闲聊固定走 legacy 通用联网检索：agent 的强项在课堂材料问答，
+            # 无纪要/无证据可引用时其检索与校验容易空转修正轮次（慢且可能落到轮次上限文案）。
+            use_agent = (not images and note is not None and agent_bridge.enabled()
+                         and not prep.get('chitchat'))
             if use_agent:
                 result = agent_bridge.answer(request.user, note, question)
                 answer, refs, followups = result['answer'], result['references'], result['followups']
                 tail = moderation.MEDICAL_DISCLAIMER
                 if moderation.health_advice_hit(question) and '不构成医疗建议' not in answer:
                     answer += tail
-            elif note is None:
-                # 无纪要目标（账号还没有已完成纪要）：通用模式，联网检索回答课堂之外的问题
+            elif note is None or prep.get('chitchat'):
+                # 无纪要目标（账号还没有已完成纪要）或寒暄闲聊：通用模式，
+                # 联网检索回答课堂之外的问题（闲聊没有可引用的证据，进 agent 必空转）
                 result = rag.answer_general(prep['rewrite'] or question)
                 if result is not None:
                     answer, refs, followups = result
@@ -436,18 +464,22 @@ class AskStreamView(APIView):
         if session.note_id:
             note = _resolve_ask_note(request, session.note_id)
         images = prepare_images(data, session, request.user)
-        general = note is None   # 无纪要目标：通用模式（纯外部联网检索，可答课堂之外的问题）
         user = request.user
-        # 自由对话（无纪要）固定走 legacy 通用联网检索：agent 无纪要时检索没有着落点，易空转轮次
-        use_agent = not images and note is not None and agent_bridge.enabled()
+        # 引擎路由在 sse() 内 _prepare_ask 之后最终决定（改写步骤会判定寒暄闲聊）；
+        # 下面先用零成本正则快判预置，供响应头在流开始前引用
+        general = note is None or is_chitchat(str(data.get('question') or ''))
+        use_agent = not images and not general and agent_bridge.enabled()
 
         def sse():
+            nonlocal use_agent, general
             prep = _prepare_ask(user, data)
             if 'reject' in prep:
                 yield _sse('blocked', {'category': 'blocked', 'message': prep['reject']})
                 return
             question = prep['question']
             rag_question = prep['rewrite'] or question
+            general = note is None or bool(prep.get('chitchat'))
+            use_agent = not images and not general and agent_bridge.enabled()
             buf, refs = '', []
             extra: dict = {}
             moderation_flag = ''
