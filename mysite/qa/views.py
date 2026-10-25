@@ -186,8 +186,8 @@ def _prepare_ask(user, data: dict) -> dict:
         rewrite, chitchat = _rewrite_question(user, data.get('session_ref', ''), question)
     if not chitchat and is_chitchat(question):
         chitchat = True
-    if not chitchat and not rewrite and is_meta_question(question):
-        chitchat = True  # 元问题仅在改写未跑成时兜底：有 flash 判定时以它为准
+    if not chitchat and is_meta_question(question):
+        chitchat = True  # 元问题硬路由：flash 判定实测会漏（线上冒烟），正则为准
     return {
         'question': question,
         'moderate': verdict,
