@@ -124,6 +124,8 @@ def build_middleware(max_model_calls):
             from langchain_core.messages import ToolMessage
             return {'messages': [ToolMessage(content='一次只调用一个工具；请根据结果决定下一步。',
                 tool_call_id=call['id'], name=call['name'], status='error') for call in message.tool_calls], 'jump_to': 'model'}
+        # 校验进度公开：草稿已上屏，这段静默期在用户眼里像「已答完却卡住」。
+        get_stream_writer()({'event': 'status', 'data': {'stage': 'validating'}})
         try:
             if message.response_metadata.get('finish_reason') not in (None, 'stop'):
                 raise ValueError('模型输出未正常结束')
