@@ -300,3 +300,23 @@ class AdminQuizListView(ListAPIView):
         if keyword:
             qs = qs.filter(stem__icontains=keyword)
         return qs
+
+
+class AdminQuizBatchDeleteView(APIView):
+    """POST /api/admin/quiz/batch_delete/ —— 批量删除题目（body: {ids: [...]}）
+    题目名下错题记录随外键级联一并清除；返回实际删除条数。"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def post(self, request):
+        ids = request.data.get('ids')
+        if not isinstance(ids, list) or not ids:
+            return Response({'detail': '请先勾选要删除的题目'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            id_list = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return Response({'detail': '记录标识有误'}, status=status.HTTP_400_BAD_REQUEST)
+        qs = QuizItem.objects.filter(pk__in=id_list)
+        deleted = qs.count()
+        qs.delete()
+        return Response({'detail': f'已删除 {deleted} 道题目', 'deleted': deleted})

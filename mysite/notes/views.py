@@ -132,3 +132,27 @@ class AdminNoteListView(ListAPIView):
         if keyword:
             qs = qs.filter(title__icontains=keyword)
         return qs
+
+
+class AdminNoteBatchDeleteView(APIView):
+    """POST /api/admin/notes/batch_delete/ —— 批量删除课堂纪要（body: {ids: [...]}）
+    纪要名下的片段、问答记录（含反馈流水）、自创题与错题随外键级联一并清除；
+    返回实际删除条数。"""
+
+    permission_classes = [IsAuthenticated, IsAdminRole]
+
+    def post(self, request):
+        ids = request.data.get('ids')
+        if not isinstance(ids, list) or not ids:
+            return Response({'detail': '请先勾选要删除的纪要'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            id_list = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return Response({'detail': '记录标识有误'}, status=status.HTTP_400_BAD_REQUEST)
+        qs = Note.objects.filter(pk__in=id_list)
+        deleted = qs.count()
+        for note in qs:  # 源文件是媒体磁盘文件，不随 CASCADE 清理，需先删
+            if note.source:
+                note.source.delete(save=False)
+        qs.delete()
+        return Response({'detail': f'已删除 {deleted} 条纪要', 'deleted': deleted})

@@ -10,4 +10,5 @@ urlpatterns = [
     path('quiz/wrong/<int:pk>/', views.WrongDeleteView.as_view()),
     path('quiz/<int:pk>/submit/', views.QuizSubmitView.as_view()),
     path('admin/quiz/', views.AdminQuizListView.as_view()),
+    path('admin/quiz/batch_delete/', views.AdminQuizBatchDeleteView.as_view()),
 ]
