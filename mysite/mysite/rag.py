@@ -127,15 +127,14 @@ def retrieve(note: Note, question: str, k: int = TOP_K) -> list[NoteChunk] | Non
     return [c for c, _ in top] if top else None
 
 
-def _align_refs(note: Note, top: list[NoteChunk], answer: str, fallback: bool = True) -> list[dict]:
-    """引用对齐：答案里标注了 [n] 的片段优先；fallback=True 时未标注兜底展示全部召回片段
-    （纯知识库档用兜底；融合档 fallback=False——模型没用知识库就不出知识库来源，
-    避免「回答全靠外部、来源里却挂着知识库」的误导）；
+def _align_refs(note: Note, top: list[NoteChunk], answer: str) -> list[dict]:
+    """引用对齐：只展示答案里真正用 [n] 标注引用的片段——答案没有标注就不出知识库来源，
+    避免「回答根本没引用资料、下面却挂着来源卡片」的误导（2026-10-26 用户反馈）；
     ref 中带 mm:ss 时间戳（如「录音 08:15」）时提取到 time 供前端挂录音定位；
     kind='kb' 标记知识库来源（与外部来源 kind='external' 区分展示）"""
     cited = sorted({int(m) for m in re.findall(r'\[\s*(\d{1,2})\s*\]', answer) if 1 <= int(m) <= len(top)})
     refs: list[dict] = []
-    for n in (cited or (list(range(1, len(top) + 1)) if fallback else [])):
+    for n in cited:
         c = top[n - 1]
         m = re.search(r'\d{1,2}:\d{2}', c.ref)
         refs.append({'label': note.title, 'time': m.group(0) if m else '',
@@ -206,9 +205,14 @@ def _mark_external(answer: str) -> str:
 # 输出格式按调用方拼接：一次性问答 → JSON（answer+followups）；流式 → 纯正文
 # （流式的追问由 qa.views._stream_followups 依据回答独立生成，不在正文里输出）。
 _KB_RULES = (
-    '你是「智学纪要」的课堂助教。严格依据给定的课堂纪要片段回答学生问题：'
+    '你是「智学纪要」的课堂助教。按学生消息的性质分两种情况处理：'
+    'A）与课堂纪要相关的学习问题：严格依据给定的课堂纪要片段回答，'
     '片段里有答案时用中文简洁分点作答，并在对应内容末尾用 [编号] 标注引用的片段；'
     '片段不足以回答时明确说明依据不足，再基于片段给出相近的学习建议，不要编造。'
+    'B）与课程无关的日常消息（寒暄闲聊、生活求助、常识讨论、观点或立场话题）：'
+    '像朋友一样自然、友好、简短地回应，这类回应不要输出 [编号] 引用，'
+    '也不要说「不属于本课程内容」这类生硬的话；'
+    '涉及观点立场的话题只客观陈述公认事实并保持中立，一两句带过，再自然地把话题引回学习。'
 )
 _FUSION_RULES = (
     '你是「智学纪要」的课堂助教。学生提问后已同时检索课堂纪要片段与外部网络资料：'
@@ -216,7 +220,8 @@ _FUSION_RULES = (
     '2）纪要未覆盖、需要补充的内容，可引用外部资料要点（用 [E编号] 标注）；'
     '凡依据外部资料作答的句子，必须在句末注明「补充自外部知识」，一处都不能漏；'
     '3）外部资料与纪要内容冲突时，以纪要为准；'
-    '4）两边都没有可靠依据的部分，明确写「暂时无法确认」，不要编造。'
+    '4）两边都没有可靠依据的部分，明确写「暂时无法确认」，不要编造；'
+    '5）若学生的消息与课程完全无关（寒暄闲聊、观点话题），自然简短地回应即可，不必强行引用。'
 )
 _EXTERNAL_RULES = (
     '你是「智学纪要」的课堂助教。学生的问题在课堂纪要片段中没有找到相关内容，'
@@ -357,6 +362,8 @@ def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
         raw_followups = data.get('followups')
         followups = ([str(x).strip() for x in raw_followups if isinstance(x, str) and x.strip()][:3]
                      if isinstance(raw_followups, list) else [])
+        if '[E' not in answer:   # 模型未引用外部要点就不挂来源（同 kb 档「没引用不展示」口径）
+            return answer, [], followups
         refs = _external_refs(findings)
         answer += '\n\n—— 来源说明 ——\n' + _source_line(refs)
         return answer, refs, followups
@@ -408,6 +415,9 @@ def answer_stream_general(question: str):
             note_line = '\n\n（以上标注 [E编号] 的内容均为补充自外部知识）'
             buf += note_line
             yield {'type': 'delta', 'text': note_line}
+        if '[E' not in buf:   # 模型未引用外部要点就不挂来源
+            yield {'type': 'end', 'refs': []}
+            return
         refs = _external_refs(findings)
         tail = '\n\n—— 来源说明 ——\n' + _source_line(refs)
         buf += tail
@@ -502,9 +512,9 @@ def answer_note(note: Note, question: str, collect: dict | None = None) -> tuple
         raw_followups = data.get('followups')
         followups = ([str(x).strip() for x in raw_followups if isinstance(x, str) and x.strip()][:3]
                      if isinstance(raw_followups, list) else [])
-        refs = _align_refs(note, top, answer, fallback=(mode == 'kb'))
-        if mode in ('fusion', 'external'):
-            refs += _external_refs(findings)
+        refs = _align_refs(note, top, answer)
+        if mode in ('fusion', 'external') and '[E' in answer:
+            refs += _external_refs(findings)   # 模型实际引用了外部要点才挂外部来源
         if refs:
             answer += '\n\n—— 来源说明 ——\n' + _source_line(refs)
         return answer, refs, followups
@@ -586,9 +596,9 @@ def answer_stream(note: Note, question: str):
             note_line = '\n\n（以上标注 [E编号] 的内容均为补充自外部知识）'
             buf += note_line
             yield {'type': 'delta', 'text': note_line}
-        refs = _align_refs(note, top, buf, fallback=(mode == 'kb'))
-        if mode in ('fusion', 'external'):
-            refs += _external_refs(findings)
+        refs = _align_refs(note, top, buf)
+        if mode in ('fusion', 'external') and '[E' in buf:
+            refs += _external_refs(findings)   # 模型实际引用了外部要点才挂外部来源
         if refs:
             tail = '\n\n—— 来源说明 ——\n' + _source_line(refs)
             buf += tail
