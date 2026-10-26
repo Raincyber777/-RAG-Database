@@ -1,10 +1,12 @@
 """
 平台 / 个人数据速览接口（工作台与数据看板用），按角色返回不同口径：
-- 普通用户：自己的纪要 / 问答 / 练习 / 错题数量
+- 普通用户：自己的纪要 / 问答 / 练习 / 错题数量 + 数据看板图表聚合（charts）
 - 管理员·超管：平台用户数 / 纪要数 / 问答数 / 待处理反馈数
 """
 from datetime import timedelta
 
+from django.db.models import Count
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -12,9 +14,15 @@ from rest_framework.views import APIView
 
 from accounts.models import User
 from feedback.models import Feedback
-from notes.models import Note
+from notes.models import Note, NoteChunk
 from qa.models import QaRecord
 from quiz.models import QuizItem, WrongRecord
+
+
+def _hot_label(text: str, limit: int) -> str:
+    """片段文本 → 看板热点标签：定义类取「术语：解释」的术语半边，其余截断到 limit 字。"""
+    t = (text or '').strip().split('：')[0].strip()
+    return (t[:limit] or '').strip() or '知识点'
 
 
 class StatsSummaryView(APIView):
@@ -39,7 +47,58 @@ class StatsSummaryView(APIView):
             'qa_records': QaRecord.objects.filter(user=user).count(),
             'quiz_items': QuizItem.objects.filter(uploader=user).count(),
             'wrong_records': WrongRecord.objects.filter(user=user).count(),
+            'charts': _personal_charts(user),
         })
+
+
+def _personal_charts(user) -> dict:
+    """个人数据看板的四张图聚合（全部实时计算）：
+    - daily：近 14 天本人追问量按天计数（缺的日子补 0）
+    - materials：本人纪要材料类型分布（doc 与未知类型并入「其他」）
+    - top_points / cloud：本人问答记录 retrieval 里命中的知识片段计数
+      （片段文本截短做标签；同标签合并计数；top_points 取 Top10，cloud 取 Top16）
+    - trend_delta：近 7 日对比前 7 日的百分比变化，无基线（前 7 日全为 0）时为 None
+    """
+    today = timezone.localdate()
+
+    per_day = dict(
+        QaRecord.objects.filter(user=user, created_at__date__gte=today - timedelta(days=13))
+        .annotate(day=TruncDate('created_at')).values_list('day')
+        .annotate(c=Count('id')).values_list('day', 'c')
+    )
+    daily = [{'date': (today - timedelta(days=o)).strftime('%m-%d'),
+              'count': per_day.get(today - timedelta(days=o), 0)} for o in range(13, -1, -1)]
+    last7 = sum(d['count'] for d in daily[7:])
+    prev7 = sum(d['count'] for d in daily[:7])
+    trend_delta = round((last7 - prev7) / prev7 * 100) if prev7 else None
+
+    mat_names = {'audio': '音频', 'video': '视频', 'image': '图片', 'ppt': 'PPT'}
+    mat_counts = {'音频': 0, '视频': 0, '图片': 0, 'PPT': 0, '其他': 0}
+    for (stype,) in Note.objects.filter(uploader=user).values_list('source_type'):
+        mat_counts[mat_names.get(stype or '', '其他')] += 1
+    materials = [{'name': k, 'value': v} for k, v in mat_counts.items()]
+
+    hits: dict[int, int] = {}
+    for (retrieval,) in QaRecord.objects.filter(user=user).values_list('retrieval'):
+        for item in retrieval or []:
+            cid = (item or {}).get('chunk_id')
+            if isinstance(cid, int):
+                hits[cid] = hits.get(cid, 0) + 1
+    merged: dict[str, int] = {}
+    if hits:
+        texts = dict(NoteChunk.objects.filter(pk__in=list(hits)).values_list('id', 'text'))
+        for cid, c in hits.items():
+            label = _hot_label(texts.get(cid, ''), 18)
+            merged[label] = merged.get(label, 0) + c
+    ranked = sorted(merged.items(), key=lambda kv: -kv[1])
+
+    return {
+        'daily': daily,
+        'materials': materials,
+        'top_points': [{'label': k, 'count': v} for k, v in ranked[:10]],
+        'cloud': [{'text': k, 'count': v} for k, v in ranked[:16]],
+        'trend_delta': trend_delta,
+    }
 
 
 class DashboardFeedView(APIView):
