@@ -146,6 +146,10 @@ def answer(user, note, question):
 
 def stream(user, note, question):
     final = None
+    # 首轮草稿照常流式上屏；一旦 agent 进入修正轮（runtime 以 replace '' 清空重写），
+    # 中间的临时草稿不再透传——前端保留已成稿的草稿、凭 status 帧看到「正在修正」，
+    # 直到结束由本函数下发的权威 replace 一次性换成最终答案，避免「成稿消失又重打」的循环观感
+    revising = False
     try:
         with _open(user, note) as (agent, context):
             with closing(agent.stream(question, context=context, thread_id=uuid4().hex)) as events:
@@ -153,7 +157,12 @@ def stream(user, note, question):
                     if event['event'] == 'done':
                         final = record_data(event['data']['output'])
                         break
-                    if event['event'] in ('status', 'delta', 'replace'):
+                    if event['event'] == 'replace':
+                        revising = True
+                        continue
+                    if event['event'] == 'delta' and revising:
+                        continue
+                    if event['event'] in ('status', 'delta'):
                         yield event
     except Exception as exc:
         logger.warning('Agent Q&A stream unavailable: %s', type(exc).__name__)

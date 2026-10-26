@@ -124,6 +124,34 @@ META_INTRO = (
 )
 
 
+# 「我上传的东西」类问题（我上传了…/我的纪要…）：系统里查得到真实记录，
+# 不能落进通用联网问答让模型凭空答「无法查看」。命中即用纪要数据作答。
+UPLOAD_QA_RE = re.compile(r'我(?:上传|传了|导入了|上传过)|我的(?:纪要|笔记|文件|材料|音频|视频|课件)')
+
+
+def is_upload_question(question: str) -> bool:
+    """「我上传了…」类问题的路由级判定：命中即强制 legacy（用真实纪要记录作答）。"""
+    return bool(UPLOAD_QA_RE.search((question or '').strip()))
+
+
+def _answer_upload_question(user, question: str) -> tuple[str, list, list] | None:
+    """用用户真实纪要回答「我上传了…」类问题；未命中返回 None 走原链路。"""
+    if not UPLOAD_QA_RE.search(question or ''):
+        return None
+    total = Note.objects.filter(uploader=user).count()
+    if not total:
+        return ('目前还没有查到你的上传记录。把课堂材料上传到「课堂纪要」并生成纪要后，'
+                '我就能基于它回答问题啦。'), [], []
+    recent = list(Note.objects.filter(uploader=user).order_by('-created_at')[:5])
+    lines = [f'查到啦！你在系统里目前共有 {total} 份纪要，最近上传的是：']
+    for n in recent:
+        state = '已完成' if n.status == Note.Status.DONE else (
+            '生成中' if n.status == Note.Status.PROCESSING else '生成失败')
+        lines.append(f'· 《{n.title}》（{n.course} · 录音 {n.duration or "时长未知"} · {state}）')
+    lines.append('要针对某份纪要提问，在「智能问答」左侧选中它即可，我会引用其中的内容并标注录音时间点。')
+    return '\n'.join(lines), [], []
+
+
 def _rewrite_question(user, session_ref: str, question: str) -> tuple[str, bool]:
     """会话内追问改写：结合本会话最近两轮把「那第二种呢？」改写成独立完整的问题，
     检索与生成都用改写结果；同时判定是否为与学习无关的寒暄闲聊（供引擎路由，
@@ -417,7 +445,7 @@ class AskView(APIView):
             # 自由对话（无纪要）与寒暄闲聊固定走 legacy 通用联网检索：agent 的强项在课堂材料问答，
             # 无纪要/无证据可引用时其检索与校验容易空转修正轮次（慢且可能落到轮次上限文案）。
             use_agent = (not images and note is not None and agent_bridge.enabled()
-                         and not prep.get('chitchat')
+                         and not prep.get('chitchat') and not is_upload_question(question)
                          and (data.get('note_id') is not None or session.note_id))
             if use_agent:
                 result = agent_bridge.answer(request.user, note, question)
@@ -425,11 +453,14 @@ class AskView(APIView):
                 tail = moderation.MEDICAL_DISCLAIMER
                 if moderation.health_advice_hit(question) and '不构成医疗建议' not in answer:
                     answer += tail
-            elif note is None or prep.get('chitchat'):
+            elif note is None or prep.get('chitchat') or is_upload_question(question):
                 # 无纪要目标（账号还没有已完成纪要）或寒暄闲聊：通用模式，
                 # 联网检索回答课堂之外的问题（闲聊没有可引用的证据，进 agent 必空转）
+                upload_qa = _answer_upload_question(request.user, question)
                 if is_meta_question(question):
                     answer, refs, followups = META_INTRO, [], []
+                elif upload_qa is not None:
+                    answer, refs, followups = upload_qa
                 else:
                     result = rag.answer_general(prep['rewrite'] or question)
                     if result is not None:
@@ -516,9 +547,9 @@ class AskStreamView(APIView):
         # agent 只服务「显式绑定纪要」的会话：自由对话即便被 _resolve_ask_note 兜底到
         # 最新纪要，也不让 agent 接管——无目标纪要的常规问题会空转烧预算（线上实测）
         explicit_note = data.get('note_id') is not None or bool(session.note_id)
-        # 流前响应头用预判：元问题也要算进 legacy，避免头标 agent 实跑 legacy
+        # 流前响应头用预判：元问题/「我上传了…」也要算进 legacy，避免头标 agent 实跑 legacy
         general = (not explicit_note or is_chitchat(question_text)
-                   or is_meta_question(question_text))
+                   or is_meta_question(question_text) or is_upload_question(question_text))
         use_agent = not images and not general and agent_bridge.enabled()
 
         def sse():
@@ -529,7 +560,7 @@ class AskStreamView(APIView):
                 return
             question = prep['question']
             rag_question = prep['rewrite'] or question
-            general = note is None or bool(prep.get('chitchat'))
+            general = note is None or bool(prep.get('chitchat')) or is_upload_question(question)
             use_agent = (not images and explicit_note and not general
                          and agent_bridge.enabled())
             buf, refs = '', []
@@ -558,7 +589,7 @@ class AskStreamView(APIView):
                         if event['event'] == 'delta':
                             buf += event['data'].get('text', '')
                         elif event['event'] == 'replace':
-                            # 语义是「替换」：新一轮修正前 replace '' 清空，结束时 replace 权威全文
+                            # 桥接层已吞掉修正轮的中间 replace：这里只会在结束时收到权威全文
                             buf = event['data'].get('text', '')
                         elif event['event'] == 'done':
                             extra = dict(event['data'])
@@ -576,20 +607,25 @@ class AskStreamView(APIView):
                     buf = META_INTRO
                     yield _sse('delta', {'text': buf})
                 else:
-                    try:
-                        gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
-                        for ev in gen:
-                            if ev['type'] == 'delta':
-                                buf += ev['text']
-                                yield _sse('delta', {'text': ev['text']})
-                            elif ev['type'] == 'end':
-                                refs = ev.get('refs') or []
-                                extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
-                                break
-                            else:  # error：已有增量则就地收尾，否则走演示降级
-                                break
-                    except Exception:
-                        pass  # 流中断：以已生成内容收尾
+                    upload_qa = _answer_upload_question(user, question) if general else None
+                    if upload_qa is not None:
+                        buf = upload_qa[0]
+                        yield _sse('delta', {'text': buf})
+                    else:
+                        try:
+                            gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
+                            for ev in gen:
+                                if ev['type'] == 'delta':
+                                    buf += ev['text']
+                                    yield _sse('delta', {'text': ev['text']})
+                                elif ev['type'] == 'end':
+                                    refs = ev.get('refs') or []
+                                    extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                                    break
+                                else:  # error：已有增量则就地收尾，否则走演示降级
+                                    break
+                        except Exception:
+                            pass  # 流中断：以已生成内容收尾
                 if not buf:
                     if general:
                         buf = rag.no_general_answer()
