@@ -12,11 +12,11 @@ class NoteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Note
         fields = [
-            'id', 'course', 'title', 'duration', 'status', 'uploader', 'uploader_name',
+            'id', 'course', 'title', 'duration', 'status', 'fail_reason', 'uploader', 'uploader_name',
             'source', 'source_type', 'theme', 'points', 'definitions', 'emphasized',
             'transcript', 'questions', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'status', 'uploader', 'theme', 'points', 'definitions',
+        read_only_fields = ['id', 'status', 'fail_reason', 'uploader', 'theme', 'points', 'definitions',
                             'emphasized', 'transcript', 'questions', 'created_at', 'updated_at']
 
     def get_questions(self, obj) -> int:

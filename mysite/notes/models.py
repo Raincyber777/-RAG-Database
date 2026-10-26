@@ -19,6 +19,7 @@ class Note(models.Model):
     title = models.CharField('课堂主题', max_length=200)
     duration = models.CharField('录音时长', max_length=20, blank=True, default='')
     status = models.CharField('处理状态', max_length=12, choices=Status.choices, default=Status.PROCESSING)
+    fail_reason = models.TextField('失败原因', blank=True, default='')  # 面向用户的可读原因，前端失败提示直接展示
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL, verbose_name='上传者',
         on_delete=models.CASCADE, related_name='notes',

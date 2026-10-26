@@ -29,6 +29,8 @@ ASR_BASE = 'https://dashscope.aliyuncs.com'
 ASR_MODEL = 'paraformer-v2'
 ASR_POLL_INTERVAL = 3      # 秒
 ASR_POLL_MAX = 400         # 最长轮询 20 分钟（一节课录音量级）
+NO_SPEECH_TEXT = ('未在材料中识别到可用的语音内容：请确认音视频里有人声讲解'
+                  '（纯音乐 / 纯画面 / 静音材料无法生成纪要），可更换材料后重试。')
 TEXT_MAX = 60000           # 文本材料保留的最大字符数（RAG 入库与转写原文共用）
 SUMMARIZE_DIRECT_MAX = 15000   # 不超过该长度直接单次总结；超出走分段 map-reduce
 SUMMARIZE_CHUNK = 12000        # map-reduce 每段目标长度（按段落边界切）
@@ -73,6 +75,10 @@ def _upload_to_oss(file_path: str) -> str:
     return 'oss://' + obj_key
 
 
+class NoSpeechError(RuntimeError):
+    """材料里没有可识别的人声（纯音乐 / 纯画面 / 静音）：区别于基础设施故障，提示文案面向用户。"""
+
+
 def _asr_sentences(file_path: str) -> list[tuple[str, str]]:
     """paraformer-v2 文件转写，返回 [(mm:ss, 句子文本)]"""
     oss_url = _upload_to_oss(file_path)
@@ -85,7 +91,7 @@ def _asr_sentences(file_path: str) -> list[tuple[str, str]]:
         },
         json={'model': ASR_MODEL,
               'input': {'file_urls': [oss_url]},
-              'parameters': {'language_hints': ['zh']}},
+              'parameters': {'language_hints': ['zh', 'en']}},
         timeout=60,
     )
     res.raise_for_status()
@@ -99,7 +105,11 @@ def _asr_sentences(file_path: str) -> list[tuple[str, str]]:
         if status_ == 'SUCCEEDED':
             break
         if status_ == 'FAILED':
-            raise RuntimeError(f'转写任务失败：{out.get("message") or "ASR task failed"}')
+            message = out.get('message') or 'ASR task failed'
+            # 无有效语音片段时任务会以 FAILED 落地（实测纯音乐/静音视频），单独识别给友好文案
+            if 'SUCCESS_WITH_NO_VALID_FRAGMENT' in message:
+                raise NoSpeechError(NO_SPEECH_TEXT)
+            raise RuntimeError(f'转写任务失败：{message}')
     else:
         raise TimeoutError('转写任务超时')
     result = out['results'][0]
@@ -337,7 +347,7 @@ def _extract_path(note: Note, path: str) -> tuple[str, str]:
     if kind in ('audio', 'video'):
         sentences = _asr_sentences(path)
         if not sentences:
-            raise RuntimeError('转写结果为空')
+            raise NoSpeechError(NO_SPEECH_TEXT)
         return '\n'.join(f'[{ts}] {text}' for ts, text in sentences), '录音'
     if kind == 'image':
         return _vision_extract(path), '板书'
@@ -517,16 +527,25 @@ def process_note(note_id: int) -> None:
             stamps = re.findall(r'^\[(\d{1,2}:\d{2})\]', content, flags=re.M)
             note.duration = stamps[-1] if stamps else note.duration  # 末句时间 ≈ 时长
         note.status = Note.Status.DONE
+        note.fail_reason = ''
         note.save()
         rag.index_note(note)  # 生成完成即向量化入库，供智能问答检索
-    except Exception:
+    except NoSpeechError as exc:
+        # 无可用语音属正常业务失败：原因直接面向用户展示，不打错误日志
+        log.info('纪要无有效语音 note=%s (%s)', note_id, note.source.path if note.source else '?')
+        note.status = Note.Status.FAILED
+        note.fail_reason = str(exc)
+        note.save(update_fields=['status', 'fail_reason', 'updated_at'])
+    except Exception as exc:
         log.exception('纪要流水线失败 note=%s', note_id)
         note.status = Note.Status.FAILED
-        note.save(update_fields=['status', 'updated_at'])
+        note.fail_reason = str(exc)[:200] or '材料处理异常，请重试或更换材料'
+        note.save(update_fields=['status', 'fail_reason', 'updated_at'])
 
 
 def start_processing(note: Note) -> None:
     """置为处理中并启动后台流水线线程（接口立即返回，前端轮询状态）"""
     note.status = Note.Status.PROCESSING
-    note.save(update_fields=['status', 'updated_at'])
+    note.fail_reason = ''  # 重新处理时清掉上次的失败原因，避免处理中仍显示旧文案
+    note.save(update_fields=['status', 'fail_reason', 'updated_at'])
     threading.Thread(target=process_note, args=(note.pk,), daemon=True).start()
