@@ -150,8 +150,20 @@ def _kb_context(top: list[NoteChunk]) -> str:
 
 
 def _pick_findings(question: str) -> list[dict]:
-    """外部知识检索 + 解析（清洗 / 去重 / 可信度 / 摘要）；失败返回空列表"""
-    return llm.search_findings(question) or []
+    """外部知识检索 + 解析（清洗 / 去重 / 可信度 / 摘要）；失败返回空列表。
+    flash 的去重按「说法」进行，同一页面提炼的多条要点都会存活——这里再按
+    （标题, 链接）去重一次，否则引用卡片会出现同源重复（2026-10-26 用户反馈）"""
+    findings = llm.search_findings(question) or []
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for f in findings:
+        key = (re.sub(r'\s+', '', str(f.get('source_title', ''))),
+               str(f.get('source_url', '')).rstrip('/'))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
 
 
 def _external_context(findings: list[dict]) -> str:
@@ -173,15 +185,20 @@ def _external_refs(findings: list[dict]) -> list[dict]:
 
 
 def _source_line(refs: list[dict]) -> str:
-    """回答末尾的来源说明（代码确定拼装而非模型复述，保证标题 / 链接真实）"""
-    kb = '、'.join(dict.fromkeys(f'《{r["label"]}》{r["detail"]}' for r in refs if r.get('kind') == 'kb'))
-    ext = '；'.join(dict.fromkeys(f'{r["label"]}（{r["url"]}）' for r in refs if r.get('kind') == 'external'))
-    parts = []
+    """回答末尾的来源说明（代码确定拼装而非模型复述，保证标题 / 链接真实）。
+    每条来源独占一行——多条揉进一行可读性差（2026-10-26 用户反馈）"""
+    kb = list(dict.fromkeys(f'《{r["label"]}》{r["detail"]}' for r in refs if r.get('kind') == 'kb'))
+    ext = list(dict.fromkeys(f'{r["label"]}（{r["url"]}）' for r in refs if r.get('kind') == 'external'))
+    lines: list[str] = []
     if kb:
-        parts.append(f'知识库来源：{kb}')
+        lines.append(f'知识库来源：{kb[0]}' if len(kb) == 1 else '知识库来源：')
+        if len(kb) > 1:
+            lines += [f'· {x}' for x in kb]
     if ext:
-        parts.append(f'外部来源：{ext}')
-    return '\n'.join(parts)
+        lines.append(f'外部来源：{ext[0]}' if len(ext) == 1 else '外部来源：')
+        if len(ext) > 1:
+            lines += [f'· {x}' for x in ext]
+    return '\n'.join(lines)
 
 
 def _no_basis_answer(note: Note) -> str:
