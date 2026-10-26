@@ -659,6 +659,28 @@ class QaLikeView(APIView):
         return Response(QaRecordSerializer(record).data)
 
 
+class QaRollbackView(APIView):
+    """POST /api/qa/rollback/ —— 会话回滚（Claude 式 rewind）：删除本会话中
+    锚点问答及其后的全部记录，前端本地同步截断并把原问题填回输入框。
+    record_id 取锚点回答的记录 id；id 单调递增，id__gte 即覆盖其后的追问。"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        session_ref = str(request.data.get('session_ref') or '').strip()
+        try:
+            record_id = int(request.data.get('record_id'))
+        except (TypeError, ValueError):
+            return Response({'detail': '无效的 record_id'}, status=status.HTTP_400_BAD_REQUEST)
+        if not session_ref:
+            return Response({'detail': '缺少 session_ref'}, status=status.HTTP_400_BAD_REQUEST)
+        # 只删本人会话内的记录；反馈流水随外键级联清除
+        qs = QaRecord.objects.filter(user=request.user, session_ref=session_ref, id__gte=record_id)
+        deleted = qs.count()
+        qs.delete()
+        return Response({'deleted': deleted})
+
+
 class QaFeedbackView(APIView):
     """POST /api/qa/{id}/feedback/ —— 按消息反馈埋点（like/dislike/copy/reask/dwell）
     写 QaFeedback 流水；like/dislike 同步 QaRecord.liked；并驱动片段权重升降（数据进化）。"""

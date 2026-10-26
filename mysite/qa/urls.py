@@ -13,6 +13,7 @@ urlpatterns = [
     path('qa/suggestions/', views.SuggestionsView.as_view()),
     path('qa/<int:pk>/like/', views.QaLikeView.as_view()),
     path('qa/<int:pk>/feedback/', views.QaFeedbackView.as_view()),
+    path('qa/rollback/', views.QaRollbackView.as_view()),
     path('admin/qa/', views.AdminQaListView.as_view()),
     path('admin/qa/batch_delete/', views.AdminQaBatchDeleteView.as_view()),
     path('admin/kb/gaps/', views.AdminKbGapListView.as_view()),
