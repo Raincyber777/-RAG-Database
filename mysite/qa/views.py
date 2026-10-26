@@ -667,14 +667,17 @@ class QaListView(ListAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        qs = QaRecord.objects.filter(user=self.request.user).select_related('note')
+        # 两条过滤分支统一倒序（新→旧，-id 兜底同秒稳定序）：前端恢复会话时统一
+        # reverse 成正序上屏（旧→新）。此前 session 分支是升序、note 分支是倒序，
+        # 前端一视同仁 reverse 后自由对话恢复就成了新消息在上（2026-10-26 用户反馈）
+        qs = QaRecord.objects.filter(user=self.request.user).select_related('note').order_by('-created_at', '-id')
         note_id = self.request.query_params.get('note')
         if note_id:
             qs = qs.filter(note_id=note_id)
         # 按前端自由对话会话拉历史（刷新后恢复会话消息）
         session = (self.request.query_params.get('session') or '').strip()
         if session:
-            qs = qs.filter(session_ref=session).order_by('created_at', 'id')
+            qs = qs.filter(session_ref=session)
         keyword = (self.request.query_params.get('search') or '').strip()
         if keyword:
             qs = qs.filter(question__icontains=keyword)
