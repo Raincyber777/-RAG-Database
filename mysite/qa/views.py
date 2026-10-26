@@ -114,6 +114,16 @@ def is_meta_question(question: str) -> bool:
     return bool(text) and len(text) <= 16 and bool(META_RE.search(text))
 
 
+# 「问助手自己/产品功能」的固定介绍文案：这类问题走外检会「查无依据」，直接给产品能力介绍
+META_INTRO = (
+    '当然可以！我是智学纪要的课堂助教，可以：\n'
+    '1. 基于你上传的课堂纪要回答课程问题，回答会标注来源；\n'
+    '2. 联网检索外部资料，补充课内没有的内容（外部结论会注明「补充自外部知识」）；\n'
+    '3. 生成学习纪要、出练习题，还支持图片提问。\n'
+    '把课堂材料上传到「课堂纪要」后体验最完整，有什么想问的尽管来～'
+)
+
+
 def _rewrite_question(user, session_ref: str, question: str) -> tuple[str, bool]:
     """会话内追问改写：结合本会话最近两轮把「那第二种呢？」改写成独立完整的问题，
     检索与生成都用改写结果；同时判定是否为与学习无关的寒暄闲聊（供引擎路由，
@@ -418,11 +428,14 @@ class AskView(APIView):
             elif note is None or prep.get('chitchat'):
                 # 无纪要目标（账号还没有已完成纪要）或寒暄闲聊：通用模式，
                 # 联网检索回答课堂之外的问题（闲聊没有可引用的证据，进 agent 必空转）
-                result = rag.answer_general(prep['rewrite'] or question)
-                if result is not None:
-                    answer, refs, followups = result
+                if is_meta_question(question):
+                    answer, refs, followups = META_INTRO, [], []
                 else:
-                    answer, refs, followups = rag.no_general_answer(), [], []
+                    result = rag.answer_general(prep['rewrite'] or question)
+                    if result is not None:
+                        answer, refs, followups = result
+                    else:
+                        answer, refs, followups = rag.no_general_answer(), [], []
                 answer = _finish_answer(answer, question)
             else:
                 # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
@@ -558,20 +571,25 @@ class AskStreamView(APIView):
                     buf += tail
                     yield _sse('delta', {'text': tail})
             else:
-                try:
-                    gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
-                    for ev in gen:
-                        if ev['type'] == 'delta':
-                            buf += ev['text']
-                            yield _sse('delta', {'text': ev['text']})
-                        elif ev['type'] == 'end':
-                            refs = ev.get('refs') or []
-                            extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
-                            break
-                        else:  # error：已有增量则就地收尾，否则走演示降级
-                            break
-                except Exception:
-                    pass  # 流中断：以已生成内容收尾
+                if general and is_meta_question(question):
+                    # 元问题（问助手自身/产品功能）：固定介绍文案，即时返回不走外检
+                    buf = META_INTRO
+                    yield _sse('delta', {'text': buf})
+                else:
+                    try:
+                        gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
+                        for ev in gen:
+                            if ev['type'] == 'delta':
+                                buf += ev['text']
+                                yield _sse('delta', {'text': ev['text']})
+                            elif ev['type'] == 'end':
+                                refs = ev.get('refs') or []
+                                extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                                break
+                            else:  # error：已有增量则就地收尾，否则走演示降级
+                                break
+                    except Exception:
+                        pass  # 流中断：以已生成内容收尾
                 if not buf:
                     if general:
                         buf = rag.no_general_answer()
