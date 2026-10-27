@@ -61,7 +61,9 @@ class QuizListView(ListAPIView):
 class QuizGenerateView(APIView):
     """
     POST /api/quiz/generate/ —— 基于纪要 LLM 出题入库
-    body: {note_id, count?, types?}（count 默认 5 上限 10；types 限定题型，兼容前端别名 multi/short）
+    body: {note_id, count?, types?, difficulties?}
+    （count 默认 5 上限 10；types 限定题型，兼容前端别名 multi/short；
+    difficulties 限定难度子集如 ["简单","困难"]，缺省 / 空表示不限——「全部」）
     真实出题：纪要片段交给 qwen-plus，按要求生成 单选 / 多选 / 不定项 / 判断 / 填空 / 简答，
     题目带难度、来源引用（可对齐到录音时间点）与知识点标签；每道题都过结构校验，
     不合格直接丢弃。LLM 不可用 / 有效题目不足时降级规则版（定义→填空、知识点→简答）。
@@ -81,7 +83,9 @@ class QuizGenerateView(APIView):
         except (TypeError, ValueError):
             count = 5
         want = _normalize_types(request.data.get('types'))
-        created = _llm_generate(note, request.user, count, want) or _rule_generate(note, request.user, count)
+        want_diff = _normalize_difficulties(request.data.get('difficulties'))
+        created = _llm_generate(note, request.user, count, want, want_diff) \
+            or _rule_generate(note, request.user, count, want_diff)
         if not created:
             return Response({'detail': '该纪要暂无可出题内容'}, status=status.HTTP_400_BAD_REQUEST)
         return Response(QuizItemSerializer(created, many=True).data, status=status.HTTP_201_CREATED)
@@ -122,6 +126,14 @@ def _normalize_types(raw) -> list[str] | None:
         if t in QuizItem.Type.values:
             out.append(t)
     return list(dict.fromkeys(out)) or None
+
+
+def _normalize_difficulties(raw) -> list[str] | None:
+    """难度过滤条件归一：只保留 简单/中等/困难，缺省 / 空 / 全非法视为不限难度"""
+    if not isinstance(raw, list):
+        return None
+    out = [d for d in dict.fromkeys(str(x).strip() for x in raw) if d in ('简单', '中等', '困难')]
+    return out or None
 
 
 def _quiz_material(note: Note) -> str:
@@ -184,15 +196,26 @@ def _valid_item(item: dict) -> dict | None:
     }
 
 
-def _llm_generate(note: Note, user, count: int, want: list[str] | None) -> list[QuizItem]:
-    """LLM 出题：材料 + 题型要求交给 qwen-plus，逐题校验入库；失败 / 不足返回已生成部分"""
+def _llm_generate(note: Note, user, count: int, want: list[str] | None,
+                  want_diff: list[str] | None) -> list[QuizItem]:
+    """LLM 出题：材料 + 题型 / 难度要求交给 qwen-plus，逐题校验入库；失败 / 不足返回已生成部分"""
     type_hint = (f'题型限定为：{"、".join(QuizItem(t).get_type_display() for t in want)}。'
                  if want else '题型尽量覆盖单选 / 多选 / 判断 / 填空，以客观题为主。')
+    # 限定难度子集时明确要求按材料真实评估并只取这些档位；不限时维持「中等为主」的分布提示。
+    # （此前提示词写死中等为主且前端不传难度，导致无论怎么选都只出中等题——2026-10-27 用户反馈）
+    if want_diff:
+        diff_hint = (f'难度限定为：{"、".join(want_diff)}。每道题的 difficulty 必须从这些值中选取，'
+                     f'并根据材料内容真实评估各题难度，不要全部标成同一档。')
+    else:
+        diff_hint = '难度以中等为主、少量简单和困难。'
+    # 难度子集下校验会丢弃标错档位的题，多要几道补足数量
+    ask_count = count + 3 if want_diff else count
     data = llm.chat_json(
         [{'role': 'system', 'content': _QUIZ_SYSTEM},
          {'role': 'user', 'content': f'课堂纪要材料：\n{_quiz_material(note)}\n\n'
-                                     f'请出 {count} 道题，{type_hint}难度以中等为主、少量简单和困难。'}],
+                                     f'请出 {ask_count} 道题，{type_hint}{diff_hint}'}],
         temperature=0.5,
+        timeout=90,   # 9~13 道题的 JSON 输出实测约 30s，默认 30s 超时会让整批出题静默失败
     )
     if not isinstance(data, dict) or not isinstance(data.get('questions'), list):
         return []
@@ -205,6 +228,8 @@ def _llm_generate(note: Note, user, count: int, want: list[str] | None) -> list[
         fields = _valid_item(item)
         if fields is None or fields['stem'] in seen:
             continue
+        if want_diff and fields['difficulty'] not in want_diff:
+            continue   # 难度子集硬过滤：模型标错档位的题不入库
         seen.add(fields['stem'])
         created.append(QuizItem.objects.create(
             uploader=user, note=note, course=note.course, chapter=note.title, **fields,
@@ -212,8 +237,11 @@ def _llm_generate(note: Note, user, count: int, want: list[str] | None) -> list[
     return created
 
 
-def _rule_generate(note: Note, user, count: int) -> list[QuizItem]:
-    """规则版降级：定义→填空、知识点→简答（带来源引用），保证接口闭环不依赖外网"""
+def _rule_generate(note: Note, user, count: int, want_diff: list[str] | None = None) -> list[QuizItem]:
+    """规则版降级：定义→填空、知识点→简答（带来源引用），保证接口闭环不依赖外网。
+    规则题难度固定为中等：难度子集不含中等时直接不出（宁可空缺也不虚标难度）。"""
+    if want_diff and '中等' not in want_diff:
+        return []
     created: list[QuizItem] = []
     for d in (note.definitions or [])[:count]:
         created.append(QuizItem.objects.create(
