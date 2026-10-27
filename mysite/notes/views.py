@@ -6,7 +6,10 @@
 按材料类型抽取（ASR 转写 / 视觉识别 / 文本直读）→ LLM 生成 → 向量化入库；
 接口立即返回 processing 状态，前端轮询详情直至 done / failed。
 """
+from datetime import timedelta
+
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import ListAPIView, ListCreateAPIView
 from rest_framework.permissions import IsAuthenticated
@@ -17,7 +20,9 @@ from mysite.utils import IsAdminRole
 
 from .models import Note
 from .serializers import NoteCreateSerializer, NoteSerializer
-from .services import start_processing
+from .services import (
+    STALE_FAIL_REASON, STALE_PROCESSING_MINUTES, fail_stale_processing, start_processing,
+)
 
 
 class NoteListCreateView(ListCreateAPIView):
@@ -27,6 +32,7 @@ class NoteListCreateView(ListCreateAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        fail_stale_processing()   # 僵尸处理态自愈（服务重启杀掉流水线线程的纪要翻转成失败）
         qs = Note.objects.filter(uploader=self.request.user)
         course = self.request.query_params.get('course')
         if course:
@@ -54,6 +60,12 @@ class NoteDetailView(APIView):
 
     def _get(self, request, pk) -> Note:
         note = get_object_or_404(Note, pk=pk)
+        # 工作台轮询的详情接口同样做僵尸态自愈：线程已死时让轮询尽快收敛到失败态
+        if (note.status == Note.Status.PROCESSING
+                and timezone.now() - note.updated_at > timedelta(minutes=STALE_PROCESSING_MINUTES)):
+            note.status = Note.Status.FAILED
+            note.fail_reason = STALE_FAIL_REASON
+            note.save(update_fields=['status', 'fail_reason', 'updated_at'])
         if note.uploader_id != request.user.pk and not request.user.is_admin_role:
             self.permission_denied(request, message='无权访问该纪要')
         return note

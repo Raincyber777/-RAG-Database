@@ -15,9 +15,11 @@ import re
 import threading
 import time
 import uuid
+from datetime import timedelta
 
 import requests
 from django.conf import settings
+from django.utils import timezone
 
 log = logging.getLogger(__name__)
 
@@ -552,3 +554,17 @@ def start_processing(note: Note) -> None:
     note.fail_reason = ''  # 重新处理时清掉上次的失败原因，避免处理中仍显示旧文案
     note.save(update_fields=['status', 'fail_reason', 'updated_at'])
     threading.Thread(target=process_note, args=(note.pk,), daemon=True).start()
+
+
+STALE_PROCESSING_MINUTES = 30   # 流水线理论上限（转写轮询 20 分钟 + 生成入库几分钟）再留余量
+STALE_FAIL_REASON = '处理超时：后台处理被中断（常见于服务重启或部署），请点击重新处理再试。'
+
+
+def fail_stale_processing() -> int:
+    """僵尸处理态自愈：PROCESSING 超过时限仍无结果的纪要直接置为失败。
+    流水线线程跑在受理上传请求的 worker 进程里，服务重启 / worker 回收会把线程连带杀掉，
+    状态就永远停在处理中、且只有失败态才有「重新处理」入口；在列表 / 详情读取时兜底翻转。"""
+    deadline = timezone.now() - timedelta(minutes=STALE_PROCESSING_MINUTES)
+    return Note.objects.filter(
+        status=Note.Status.PROCESSING, updated_at__lt=deadline,
+    ).update(status=Note.Status.FAILED, fail_reason=STALE_FAIL_REASON, updated_at=timezone.now())
