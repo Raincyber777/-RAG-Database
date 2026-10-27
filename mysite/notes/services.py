@@ -374,6 +374,7 @@ def _summarize(content: str, source_label: str) -> dict:
         [{'role': 'system', 'content': system},
          {'role': 'user', 'content': f'课堂材料（来源：{source_label}）：\n{content}'}],
         temperature=0.3,
+        timeout=90,   # 长材料 JSON 输出可能超默认 30s，超时即整篇纪要静默失败
     )
     if not isinstance(data, dict):
         raise RuntimeError('纪要生成失败（模型输出异常）')
@@ -439,6 +440,7 @@ def _summarize_part(content: str, source_label: str, idx: int, total: int) -> di
         [{'role': 'system', 'content': system},
          {'role': 'user', 'content': f'课堂材料片段（来源：{source_label}）：\n{content}'}],
         temperature=0.2,
+        timeout=90,
     )
     return data if isinstance(data, dict) else {}
 
@@ -503,6 +505,7 @@ def _summarize_long(content: str, source_label: str) -> dict:
         [{'role': 'system', 'content': system},
          {'role': 'user', 'content': candidate}],
         temperature=0.2,
+        timeout=90,
     )
     if isinstance(data, dict) and data.get('points'):
         return data
