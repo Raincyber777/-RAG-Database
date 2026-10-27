@@ -10,7 +10,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from mysite.moderation import moderate
 from mysite.utils import IsAdminRole, validate_image
+from safety.masking import mask_contact
+from safety.models import SensitiveAuditLog
 
 from .models import Feedback
 from .serializers import FeedbackCreateSerializer, FeedbackSerializer
@@ -33,6 +36,16 @@ class FeedbackListCreateView(ListCreateAPIView):
 
         serializer = FeedbackCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        # 反馈文本自动审核：违规 / 立场性内容直接拒绝（审核组件内部 fail-open，故障不拦正常反馈）
+        text = f"{serializer.validated_data.get('title', '')}\n{serializer.validated_data.get('content', '')}"
+        verdict = moderate(text)
+        if verdict['verdict'] in ('block', 'redirect'):
+            SensitiveAuditLog.objects.create(
+                user=request.user, kind=verdict['category'], action='block',
+                question=mask_contact(text)[:500], detail={'source': 'feedback'},
+            )
+            return Response({'detail': verdict['message']}, status=status.HTTP_400_BAD_REQUEST)
 
         # 截图存到 media/feedback/，JSONField 里只存 media 相对路径
         images = [default_storage.save(f'feedback/{f.name}', f) for f in files]

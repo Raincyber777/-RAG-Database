@@ -27,9 +27,8 @@ from notes.models import Note, NoteChunk
 from safety.masking import mask_contact, mask_health_detail
 from safety.models import HealthProfile, SensitiveAuditLog
 
-from .models import KnowledgeGap, QaFeedback, QaRecord, TrainingSample
-from .serializers import (AskSerializer, KnowledgeGapSerializer, QaRecordSerializer,
-                          TrainingSampleSerializer)
+from .models import KnowledgeGap, QaFeedback, QaRecord
+from .serializers import AskSerializer, QaRecordSerializer
 from . import agent_bridge
 from .sessions import prepare_session, save_answer
 from .images import prepare_images, image_events
@@ -742,137 +741,6 @@ class QaFeedbackView(APIView):
         return Response({'action': action, 'liked': record.liked})
 
 
-# ---------- 训练样本（强审核：生成 → 待审核 → 人工通过 → 导出） ----------
-
-class TrainingGenerateView(APIView):
-    """POST /api/admin/training/generate/ —— 从高质量问答生成训练样本候选
-    选材：课内问答 + 有正反馈（点赞 / 复制 / 停留）+ 无审核标记 + 有召回片段 + 答案非兜底话术；
-    清洗：剥来源说明尾缀（引用已在 references 结构化）、按 规范化问题+top片段 去重；
-    过滤：qwen-plus 判定答案是否扎根召回片段；全部落 pending，人工审核后才可导出。
-    单次最多处理 30 条，防止同步请求超时。"""
-
-    permission_classes = [IsAuthenticated, IsAdminRole]
-    LIMIT = 30
-
-    def post(self, request):
-        candidates = (QaRecord.objects
-                      .filter(note__isnull=False, moderation='')
-                      .filter(Q(liked=True) | Q(feedbacks__action__in=('copy', 'dwell')))
-                      .exclude(answer__contains='暂时无法确认')
-                      .distinct().order_by('-created_at'))
-        created = skipped = judged = 0
-        for record in candidates:
-            if created + judged >= self.LIMIT:
-                break
-            if not record.retrieval or len(record.answer) < 50 or len(record.answer) > 2000:
-                continue
-            if TrainingSample.objects.filter(record=record).exists():
-                skipped += 1
-                continue
-            # 清洗：剥掉回答尾部的来源说明（来源已结构化在 references）
-            answer = record.answer.split('—— 来源说明 ——')[0].strip()
-            if len(answer) < 50:
-                continue
-            top_id = next((e['chunk_id'] for e in record.retrieval if e.get('chunk_id')), None)
-            if top_id is None:
-                continue
-            dedup_key = ''.join(record.question.split())[:80] + f'|{top_id}'
-            dedup_hash = hashlib.sha256(dedup_key.encode()).hexdigest()
-            if TrainingSample.objects.filter(dedup_hash=dedup_hash).exists():
-                skipped += 1
-                continue
-            chunks = NoteChunk.objects.in_bulk([e['chunk_id'] for e in record.retrieval if e.get('chunk_id')])
-            context = [{'text': chunks[e['chunk_id']].text, 'ref': e.get('ref', ''), 'score': e.get('score', 0)}
-                       for e in record.retrieval if e.get('chunk_id') in chunks][:4]
-            if not context:
-                continue
-            if llm.available() and not _sample_quality_ok(record.question, answer, context):
-                skipped += 1
-                judged += 1
-                continue
-            TrainingSample.objects.create(
-                record=record, note=record.note,
-                query=record.question, question_rewrite=record.question_rewrite,
-                context=context, answer=answer, sources=record.references or [],
-                dedup_hash=dedup_hash,
-            )
-            created += 1
-        return Response({'created': created, 'skipped': skipped})
-
-
-def _sample_quality_ok(question: str, answer: str, context: list[dict]) -> bool:
-    """强模型预筛：答案是否扎根召回片段、完整且无明显编造；判定失败按通过处理（人工审核兜底）。"""
-    ctx = '\n'.join(f'[{i + 1}] ({c["ref"]}) {c["text"]}' for i, c in enumerate(context))
-    data = llm.chat_json(
-        [{'role': 'system', 'content': (
-            '你是训练样本质检员。给定学生问题、课堂纪要片段和候选答案，判断该问答是否适合作为训练样本：'
-            '1）答案确实依据片段作答、无明显编造；2）回答完整、可直接用于教学场景；'
-            '3）没有针对个人的内容。任一不满足 → ok=false。'
-            '只输出 JSON：{"ok": true 或 false}')},
-         {'role': 'user', 'content': f'问题：{question}\n\n纪要片段：\n{ctx}\n\n候选答案：\n{answer[:1200]}'}],
-        model=llm.MODEL_CHAT, temperature=0.1, timeout=15,
-    )
-    if not isinstance(data, dict):
-        return True
-    return bool(data.get('ok', True))
-
-
-class TrainingSampleListView(ListAPIView):
-    """GET /api/admin/training/samples/?status= —— 训练样本池巡检"""
-
-    serializer_class = TrainingSampleSerializer
-    permission_classes = [IsAuthenticated, IsAdminRole]
-
-    def get_queryset(self):
-        qs = TrainingSample.objects.select_related('note', 'record')
-        st = (self.request.query_params.get('status') or '').strip()
-        if st:
-            qs = qs.filter(status=st)
-        return qs
-
-
-class TrainingSampleReviewView(APIView):
-    """POST /api/admin/training/samples/{id}/review/ —— 人工审核（body: {action: approve|reject, note?}）"""
-
-    permission_classes = [IsAuthenticated, IsAdminRole]
-
-    def post(self, request, pk):
-        sample = TrainingSample.objects.filter(pk=pk).first()
-        if sample is None:
-            return Response({'detail': '样本不存在'}, status=status.HTTP_404_NOT_FOUND)
-        action = str(request.data.get('action') or '')
-        if action == 'approve':
-            sample.status = TrainingSample.Status.APPROVED
-        elif action == 'reject':
-            sample.status = TrainingSample.Status.REJECTED
-        else:
-            return Response({'detail': 'action 须为 approve / reject'}, status=status.HTTP_400_BAD_REQUEST)
-        sample.reviewer_note = str(request.data.get('note') or '')[:200]
-        sample.save(update_fields=['status', 'reviewer_note', 'updated_at'])
-        return Response(TrainingSampleSerializer(sample).data)
-
-
-class TrainingSampleExportView(APIView):
-    """GET /api/admin/training/samples/export/ —— 导出已通过样本为 JSONL
-    每行：{query, question_rewrite, context: [{text, ref, score}], answer, sources}"""
-
-    permission_classes = [IsAuthenticated, IsAdminRole]
-
-    def get(self, request):
-        lines = [
-            json.dumps({
-                'query': s.query, 'question_rewrite': s.question_rewrite,
-                'context': s.context, 'answer': s.answer, 'sources': s.sources,
-            }, ensure_ascii=False)
-            for s in TrainingSample.objects.filter(status=TrainingSample.Status.APPROVED)
-                                            .select_related('note').order_by('id')
-        ]
-        resp = HttpResponse('\n'.join(lines) + ('\n' if lines else ''),
-                            content_type='application/x-ndjson')
-        resp['Content-Disposition'] = 'attachment; filename=training_samples.jsonl'
-        return resp
-
-
 class AdminQaListView(ListAPIView):
     """GET /api/admin/qa/ —— 全部问答记录（?search=）"""
 
@@ -907,37 +775,3 @@ class AdminQaBatchDeleteView(APIView):
         qs.delete()
         return Response({'detail': f'已删除 {deleted} 条问答记录', 'deleted': deleted})
 
-
-# ---------- 知识库缺口（无依据问题聚合，补充材料后闭环） ----------
-
-class AdminKbGapListView(ListAPIView):
-    """GET /api/admin/kb/gaps/?status= —— 知识库缺口列表（模型默认按出现次数降序）"""
-
-    serializer_class = KnowledgeGapSerializer
-    permission_classes = [IsAuthenticated, IsAdminRole]
-
-    def get_queryset(self):
-        qs = KnowledgeGap.objects.all()
-        st = (self.request.query_params.get('status') or '').strip()
-        if st:
-            qs = qs.filter(status=st)
-        return qs
-
-
-class KbGapActionView(APIView):
-    """POST /api/admin/kb/gaps/{id}/{resolve|ignore}/ —— 标记缺口已补充 / 已忽略"""
-
-    permission_classes = [IsAuthenticated, IsAdminRole]
-
-    def post(self, request, pk, action):
-        gap = KnowledgeGap.objects.filter(pk=pk).first()
-        if gap is None:
-            return Response({'detail': '缺口不存在'}, status=status.HTTP_404_NOT_FOUND)
-        if action == 'resolve':
-            gap.status = KnowledgeGap.Status.RESOLVED
-        elif action == 'ignore':
-            gap.status = KnowledgeGap.Status.IGNORED
-        else:
-            return Response({'detail': '未知操作'}, status=status.HTTP_404_NOT_FOUND)
-        gap.save(update_fields=['status', 'updated_at'])
-        return Response(KnowledgeGapSerializer(gap).data)

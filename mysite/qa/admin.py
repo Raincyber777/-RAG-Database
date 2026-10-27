@@ -1,7 +1,7 @@
 """Django 后台注册：问答记录 / 反馈埋点 / 训练样本 / 知识库缺口（调试查看数据）"""
 from django.contrib import admin
 
-from .models import KnowledgeGap, QaFeedback, QaRecord, TrainingSample
+from .models import KnowledgeGap, QaFeedback, QaRecord
 
 
 @admin.register(QaRecord)
@@ -21,17 +21,6 @@ class QaFeedbackAdmin(admin.ModelAdmin):
     list_display = ['id', 'user', 'record', 'action', 'value', 'created_at']
     list_filter = ['action']
     search_fields = ['user__username', 'value']
-
-
-@admin.register(TrainingSample)
-class TrainingSampleAdmin(admin.ModelAdmin):
-    list_display = ['id', 'status', 'short_query', 'note', 'created_at']
-    list_filter = ['status']
-    search_fields = ['query', 'answer']
-
-    @admin.display(description='问题')
-    def short_query(self, obj):
-        return obj.query[:40]
 
 
 @admin.register(KnowledgeGap)

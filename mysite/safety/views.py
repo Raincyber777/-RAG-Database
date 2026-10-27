@@ -1,16 +1,13 @@
 """安全模块接口：
 - GET/PATCH /api/user/profile/ —— 本人健康档案（字段级权限：仅本人可读写，无管理员明文接口）
-- GET /api/admin/audit/logs/ —— 敏感审核日志巡检（管理员，?kind= 过滤）
+敏感内容审计只由问答 / 反馈 / 上传链路自动写入（mysite/moderation.py），不再提供人工巡检页面。
 """
-from rest_framework import generics
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
-from mysite.utils import IsAdminRole
-
-from .models import HealthProfile, SensitiveAuditLog
-from .serializers import HealthProfileSerializer, SensitiveAuditLogSerializer
+from .models import HealthProfile
+from .serializers import HealthProfileSerializer
 
 
 class HealthProfileView(APIView):
@@ -34,16 +31,3 @@ class HealthProfileView(APIView):
         ser.save()
         return Response(HealthProfileSerializer(profile).data)
 
-
-class AdminAuditLogListView(generics.ListAPIView):
-    """GET /api/admin/audit/logs/?kind= —— 敏感审核日志（管理员）"""
-
-    serializer_class = SensitiveAuditLogSerializer
-    permission_classes = [IsAuthenticated, IsAdminRole]
-
-    def get_queryset(self):
-        qs = SensitiveAuditLog.objects.select_related('user')
-        kind = (self.request.query_params.get('kind') or '').strip()
-        if kind:
-            qs = qs.filter(kind=kind)
-        return qs

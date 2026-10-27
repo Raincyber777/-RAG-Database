@@ -2,7 +2,7 @@
 智能问答模型
 每条回答携带引用来源（references）：录音时间点 / PPT·板书页码，与前端溯源卡片对应。
 QaRecord 即对话日志：除问答本体与引用外，还落召回片段（retrieval）、改写问题、
-审核标记（moderation）等进化原料；反馈埋点走 QaFeedback，训练样本走 TrainingSample。
+审核标记（moderation）等进化原料；反馈埋点与知识缺口自动沉淀，无需人工审核环节。
 """
 import uuid
 from django.conf import settings
@@ -97,44 +97,6 @@ class QaFeedback(models.Model):
 
     def __str__(self):
         return f'{self.user.username} {self.get_action_display()} #{self.record_id}'
-
-
-class TrainingSample(models.Model):
-    """训练样本池：高质量问答经清洗去重 + 强模型预筛后进入待审核，
-    管理端人工通过（approved）后方可导出 JSONL——原始对话不直接用于训练。"""
-    class Status(models.TextChoices):
-        PENDING = 'pending', '待审核'
-        APPROVED = 'approved', '已通过'
-        REJECTED = 'rejected', '已驳回'
-
-    record = models.ForeignKey(
-        QaRecord, verbose_name='来源问答', on_delete=models.SET_NULL,
-        related_name='training_samples', null=True, blank=True,
-    )
-    note = models.ForeignKey(
-        'notes.Note', verbose_name='关联纪要', on_delete=models.SET_NULL,
-        related_name='training_samples', null=True, blank=True,
-    )
-    query = models.TextField('问题')
-    question_rewrite = models.CharField('改写后的问题', max_length=500, blank=True, default='')
-    context = models.JSONField('召回片段', default=list, blank=True)  # [{text, ref, score}]
-    answer = models.TextField('标准答案')
-    sources = models.JSONField('来源', default=list, blank=True)
-    status = models.CharField('状态', max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
-    # 去重键：sha256(规范化问题 + top 片段 id)，同一问答不重复入池
-    dedup_hash = models.CharField('去重键', max_length=64, db_index=True, unique=True)
-    reviewer_note = models.CharField('审核备注', max_length=200, blank=True, default='')
-    created_at = models.DateTimeField('入池时间', auto_now_add=True)
-    updated_at = models.DateTimeField('更新时间', auto_now=True)
-
-    class Meta:
-        db_table = 'training_sample'
-        verbose_name = '训练样本'
-        verbose_name_plural = verbose_name
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f'[{self.get_status_display()}] {self.query[:20]}'
 
 
 class KnowledgeGap(models.Model):

@@ -1,7 +1,7 @@
 """安全模块序列化器"""
 from rest_framework import serializers
 
-from .models import HealthProfile, SensitiveAuditLog
+from .models import HealthProfile
 
 
 class HealthProfileSerializer(serializers.ModelSerializer):
@@ -12,13 +12,3 @@ class HealthProfileSerializer(serializers.ModelSerializer):
         model = HealthProfile
         fields = ['allergies', 'medications', 'conditions', 'diet_taboos', 'updated_at']
         read_only_fields = ['updated_at']
-
-
-class SensitiveAuditLogSerializer(serializers.ModelSerializer):
-    """审计日志（管理端只读）：question/detail 已在写入侧脱敏。"""
-    user_name = serializers.CharField(source='user.username', read_only=True, default='（已注销）')
-
-    class Meta:
-        model = SensitiveAuditLog
-        fields = ['id', 'user', 'user_name', 'kind', 'question', 'action', 'detail', 'created_at']
-        read_only_fields = fields

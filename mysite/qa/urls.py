@@ -1,4 +1,4 @@
-"""问答路由：/api/qa/* 与 /api/admin/qa/*、训练样本 /api/admin/training/*"""
+"""问答路由：/api/qa/* 与 /api/admin/qa/*"""
 from django.urls import path
 
 from . import views
@@ -16,10 +16,4 @@ urlpatterns = [
     path('qa/rollback/', views.QaRollbackView.as_view()),
     path('admin/qa/', views.AdminQaListView.as_view()),
     path('admin/qa/batch_delete/', views.AdminQaBatchDeleteView.as_view()),
-    path('admin/kb/gaps/', views.AdminKbGapListView.as_view()),
-    path('admin/kb/gaps/<int:pk>/<str:action>/', views.KbGapActionView.as_view()),
-    path('admin/training/generate/', views.TrainingGenerateView.as_view()),
-    path('admin/training/samples/export/', views.TrainingSampleExportView.as_view()),
-    path('admin/training/samples/', views.TrainingSampleListView.as_view()),
-    path('admin/training/samples/<int:pk>/review/', views.TrainingSampleReviewView.as_view()),
 ]

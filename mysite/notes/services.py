@@ -25,6 +25,9 @@ log = logging.getLogger(__name__)
 
 from mysite import llm, rag
 from mysite.media_storage import local_material_path
+from mysite.moderation import moderate
+from safety.masking import mask_contact
+from safety.models import SensitiveAuditLog
 from notes.models import Note
 
 ASR_BASE = 'https://dashscope.aliyuncs.com'
@@ -521,6 +524,19 @@ def process_note(note_id: int) -> None:
         return
     try:
         content, source_label = _extract(note)
+        # 上传材料自动审核：命中高置信违规内容直接拒绝生成（课程材料含健康 / 政治等教学内容不算违规，
+        # 只有词库高置信违规才拦；政治半命中交由 moderate 内部分类，中性教学材料放行）
+        if moderate(f'{note.title}\n{content[:2000]}')['verdict'] == 'block':
+            note.status = Note.Status.FAILED
+            note.fail_reason = '材料中包含违规或不当内容，已被自动审核拦截；请检查材料后重新上传。'
+            note.save(update_fields=['status', 'fail_reason', 'updated_at'])
+            SensitiveAuditLog.objects.create(
+                user=note.uploader, kind='blocked', action='block',
+                question=mask_contact(f'{note.title}\n{content[:300]}')[:500],
+                detail={'source': 'upload', 'note_id': note.pk},
+            )
+            log.info('纪要材料违规拦截 note=%s', note_id)
+            return
         fields = (_summarize(content, source_label) if len(content) <= SUMMARIZE_DIRECT_MAX
                   else _summarize_long(content, source_label))
         note.theme = fields['theme'] or note.title

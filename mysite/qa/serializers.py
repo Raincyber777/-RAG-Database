@@ -2,7 +2,7 @@
 from rest_framework import serializers
 from django.core.files.storage import default_storage
 
-from .models import KnowledgeGap, QaRecord, TrainingSample
+from .models import KnowledgeGap, QaRecord
 
 
 class QaRecordSerializer(serializers.ModelSerializer):
@@ -28,23 +28,6 @@ class QaRecordSerializer(serializers.ModelSerializer):
         fields = ['id', 'note', 'note_title', 'course', 'user_name', 'question', 'answer',
                   'references', 'followups', 'liked', 'created_at', 'session_ref',
                   'question_rewrite', 'retrieval', 'used_external', 'profile_updated', 'moderation', 'attachments']
-        read_only_fields = fields
-
-
-class TrainingSampleSerializer(serializers.ModelSerializer):
-    note_title = serializers.CharField(source='note.title', read_only=True, default='')
-
-    class Meta:
-        model = TrainingSample
-        fields = ['id', 'record', 'note', 'note_title', 'query', 'question_rewrite',
-                  'context', 'answer', 'sources', 'status', 'reviewer_note', 'created_at']
-        read_only_fields = fields
-
-
-class KnowledgeGapSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = KnowledgeGap
-        fields = ['id', 'key', 'question', 'count', 'status', 'created_at', 'updated_at']
         read_only_fields = fields
 
 
