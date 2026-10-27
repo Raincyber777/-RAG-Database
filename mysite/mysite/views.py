@@ -25,6 +25,24 @@ def _hot_label(text: str, limit: int) -> str:
     return (t[:limit] or '').strip() or '知识点'
 
 
+def _retrieval_ranked(qs, label_limit: int = 18) -> list[tuple[str, int]]:
+    """问答记录 retrieval 命中的知识片段计数（个人 / 平台看板热点共用）：
+    同一片段被命中一次计一次，片段文本截短做标签、同标签合并，按命中次数降序。"""
+    hits: dict[int, int] = {}
+    for (retrieval,) in qs.values_list('retrieval'):
+        for item in retrieval or []:
+            cid = (item or {}).get('chunk_id')
+            if isinstance(cid, int):
+                hits[cid] = hits.get(cid, 0) + 1
+    merged: dict[str, int] = {}
+    if hits:
+        texts = dict(NoteChunk.objects.filter(pk__in=list(hits)).values_list('id', 'text'))
+        for cid, c in hits.items():
+            label = _hot_label(texts.get(cid, ''), label_limit)
+            merged[label] = merged.get(label, 0) + c
+    return sorted(merged.items(), key=lambda kv: -kv[1])
+
+
 class StatsSummaryView(APIView):
     """GET /api/stats/summary/ —— 数据速览"""
 
@@ -78,19 +96,7 @@ def _personal_charts(user) -> dict:
         mat_counts[mat_names.get(stype or '', '其他')] += 1
     materials = [{'name': k, 'value': v} for k, v in mat_counts.items()]
 
-    hits: dict[int, int] = {}
-    for (retrieval,) in QaRecord.objects.filter(user=user).values_list('retrieval'):
-        for item in retrieval or []:
-            cid = (item or {}).get('chunk_id')
-            if isinstance(cid, int):
-                hits[cid] = hits.get(cid, 0) + 1
-    merged: dict[str, int] = {}
-    if hits:
-        texts = dict(NoteChunk.objects.filter(pk__in=list(hits)).values_list('id', 'text'))
-        for cid, c in hits.items():
-            label = _hot_label(texts.get(cid, ''), 18)
-            merged[label] = merged.get(label, 0) + c
-    ranked = sorted(merged.items(), key=lambda kv: -kv[1])
+    ranked = _retrieval_ranked(QaRecord.objects.filter(user=user))
 
     return {
         'daily': daily,
@@ -103,7 +109,8 @@ def _personal_charts(user) -> dict:
 
 class DashboardFeedView(APIView):
     """GET /api/stats/dashboard/ —— 管理端数据看板聚合（仅管理员）
-    近 7 日问答量按天聚合 + 最新动态（纪要完成 / 提问 / 注册 / 反馈合并取最新）+ 7 日增量。
+    近 7 日问答量按天聚合 + 最新动态（纪要完成 / 提问 / 注册 / 反馈合并取最新）
+    + 热门知识点（问答命中片段聚合）+ 7 日增量。
     """
 
     permission_classes = [IsAuthenticated]
@@ -141,6 +148,8 @@ class DashboardFeedView(APIView):
         return Response({
             'weekly': weekly,
             'events': [{'time': fmt(dt), 'text': text} for dt, text in events[:12]],
+            # 热门知识点：全平台问答命中的知识片段聚合（和个人看板词云同源），管理端词云展示
+            'hot_terms': [{'text': k, 'count': v} for k, v in _retrieval_ranked(QaRecord.objects.all())[:16]],
             'counts': {
                 'users_7d': User.objects.filter(role='user', created_at__date__gte=week_start).count(),
                 'notes_7d': Note.objects.filter(
