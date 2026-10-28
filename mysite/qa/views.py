@@ -494,6 +494,23 @@ class AskView(APIView):
         return response
 
 
+def _refusal_followups(note: Note | None) -> list[str]:
+    """拒答（no_basis）后的追问建议：改为从纪要自身内容确定性生成。
+    此前拒答也走轻量模型自由发挥，三条几乎总是「如何上传材料 / 怎么生成纪要」同款；
+    这里直接取纪要的定义与知识点拼建议，拒答时也能把用户引回课内内容。"""
+    if note is None:
+        return []
+    out = [f'《{note.title}》这节课的重点是什么？']
+    terms = [d.get('term') for d in (note.definitions or []) if d.get('term')]
+    pts = [str(p.get('text', '')).strip() for p in (note.points or []) if p.get('text')]
+    if terms:
+        out.append(f'「{terms[0]}」是什么意思？')
+    if pts:
+        out.append(f'能展开讲讲「{pts[0][:14]}」吗？')
+    out.append(f'根据《{note.title}》出几道练习题')
+    return out[:3]
+
+
 def _stream_followups(note: Note | None, question: str, answer: str) -> list[str]:
     """流式回答完成后的追问建议：轻量模型依据问题与回答节选独立生成；失败返回空（通用问答无纪要上下文）"""
     head = (f'学生刚在《{note.title}》（{note.course}）提问：「{question}」'
@@ -637,8 +654,12 @@ class AskStreamView(APIView):
                     buf += tail
                     yield _sse('delta', {'text': tail})
 
-            followups = [] if moderation_flag else (
-                list(extra.get('followups') or []) or _stream_followups(note, question, buf))
+            if moderation_flag:
+                followups = []
+            elif extra.get('mode') == 'no_basis':
+                followups = _refusal_followups(note)
+            else:
+                followups = list(extra.get('followups') or []) or _stream_followups(note, question, buf)
             record = save_answer(session,
                 user=user, note=note, question=question,
                 answer=buf, references=refs, followups=followups,

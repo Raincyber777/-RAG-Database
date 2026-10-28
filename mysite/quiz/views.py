@@ -39,14 +39,16 @@ def _is_correct(quiz: QuizItem, my_answer: str) -> bool:
 
 
 class QuizListView(ListAPIView):
-    """GET /api/quiz/ —— 题库列表（?course=&chapter=&type=&search=）"""
+    """GET /api/quiz/ —— 本人题库列表（?course=&chapter=&type=&search=）
+    只返回本人纪要生成的题目：练习页出题范围按本人课程 / 纪要展开，
+    串库会把别人的题混进空范围会话（无纪要账号也能凭他人题目出卷）。"""
 
     queryset = QuizItem.objects.select_related('uploader', 'note')
     serializer_class = QuizItemSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().filter(uploader=self.request.user)
         params = self.request.query_params
         for field in ('course', 'chapter', 'type'):
             value = params.get(field)

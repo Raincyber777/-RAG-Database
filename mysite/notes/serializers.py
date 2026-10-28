@@ -63,6 +63,19 @@ class NoteCreateSerializer(serializers.ModelSerializer):
         label, mb = self.KIND_LIMITS[self._kind_of(ext)]
         if file.size and file.size > mb * 1024 * 1024:
             raise serializers.ValidationError(f'{label}文件过大：最大支持 {mb}MB，请压缩后再上传')
+        if self._kind_of(ext) == 'image':
+            # 扩展名对不等于内容对：macOS 解压出的 ._ 开头资源文件、损坏图片都顶着 .png 后缀，
+            # 不在这里拦住就会流到多模态模型才失败（表现为转圈 / 中断）。用 PIL 实际开图校验。
+            from PIL import Image, UnidentifiedImageError
+            try:
+                file.seek(0)
+                with Image.open(file) as img:
+                    img.verify()
+                file.seek(0)
+            except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+                raise serializers.ValidationError(
+                    '图片文件损坏或不是有效图片（请勿上传 ._ 开头的系统隐藏文件），请重新选择后上传'
+                ) from None
         return file
 
     @staticmethod
