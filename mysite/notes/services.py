@@ -52,6 +52,13 @@ def _mmss(milliseconds: int) -> str:
     return f'{total // 60:02d}:{total % 60:02d}'
 
 
+def _touch(note_id: int) -> None:
+    """流水线心跳：只刷新 updated_at。僵尸自愈（fail_stale_processing）按 updated_at 距今判断，
+    在长阶段（转写轮询等）期间打点后，30 分钟阈值就变成「无进展时长」而非总时长，
+    健康但慢的视频纪要不再被误杀成「处理超时」。"""
+    Note.objects.filter(pk=note_id).update(updated_at=timezone.now())
+
+
 def _upload_to_oss(file_path: str) -> str:
     """本地文件上传到 DashScope 临时 OSS，返回 oss:// 引用（录音文件识别要求可访问 URL）"""
     filename = f'{uuid.uuid4().hex}-{os.path.basename(file_path)}'
@@ -84,7 +91,7 @@ class NoSpeechError(RuntimeError):
     """材料里没有可识别的人声（纯音乐 / 纯画面 / 静音）：区别于基础设施故障，提示文案面向用户。"""
 
 
-def _asr_sentences(file_path: str) -> list[tuple[str, str]]:
+def _asr_sentences(file_path: str, note: Note | None = None) -> list[tuple[str, str]]:
     """paraformer-v2 文件转写，返回 [(mm:ss, 句子文本)]"""
     oss_url = _upload_to_oss(file_path)
     res = requests.post(
@@ -99,10 +106,22 @@ def _asr_sentences(file_path: str) -> list[tuple[str, str]]:
               'parameters': {'language_hints': ['zh', 'en']}},
         timeout=60,
     )
-    res.raise_for_status()
+    if res.status_code != 200:
+        # 错误体里才有真实原因（欠费=Arrearage / 参数=InvalidParameter）；raise_for_status 只剩状态码
+        try:
+            err = res.json()
+        except ValueError:
+            err = {}
+        code = str(err.get('code') or '')
+        if code == 'Arrearage':
+            raise RuntimeError('模型服务（百炼）账户欠费，请充值后点击重新处理')
+        raise RuntimeError(
+            f'转写任务提交失败（{res.status_code}）：{code or str(err.get("message") or "")[:120]}')
     task_id = res.json()['output']['task_id']
-    for _ in range(ASR_POLL_MAX):
+    for i in range(ASR_POLL_MAX):
         time.sleep(ASR_POLL_INTERVAL)
+        if note is not None and i % 10 == 0:
+            _touch(note.pk)   # 转写最长可轮询 20 分钟：期间心跳保活，防僵尸自愈误杀
         out = requests.get(f'{ASR_BASE}/api/v1/tasks/{task_id}',
                            headers={'Authorization': f'Bearer {settings.DASHSCOPE_API_KEY}'},
                            timeout=30).json().get('output', {})
@@ -350,7 +369,7 @@ def _extract(note: Note) -> tuple[str, str]:
 def _extract_path(note: Note, path: str) -> tuple[str, str]:
     kind = note.source_type or 'audio'
     if kind in ('audio', 'video'):
-        sentences = _asr_sentences(path)
+        sentences = _asr_sentences(path, note)
         if not sentences:
             raise NoSpeechError(NO_SPEECH_TEXT)
         return '\n'.join(f'[{ts}] {text}' for ts, text in sentences), '录音'
@@ -524,6 +543,7 @@ def process_note(note_id: int) -> None:
         return
     try:
         content, source_label = _extract(note)
+        _touch(note.pk)   # 抽取（含最长 20 分钟的转写轮询）结束：进入生成阶段前打一次点
         # 上传材料自动审核：命中高置信违规内容直接拒绝生成（课程材料含健康 / 政治等教学内容不算违规，
         # 只有词库高置信违规才拦；政治半命中交由 moderate 内部分类，中性教学材料放行）
         if moderate(f'{note.title}\n{content[:2000]}')['verdict'] == 'block':
@@ -572,12 +592,12 @@ def start_processing(note: Note) -> None:
     threading.Thread(target=process_note, args=(note.pk,), daemon=True).start()
 
 
-STALE_PROCESSING_MINUTES = 30   # 流水线理论上限（转写轮询 20 分钟 + 生成入库几分钟）再留余量
+STALE_PROCESSING_MINUTES = 30   # 「无进展时长」阈值：流水线有心跳保活，超过即线程已死 / 彻底卡住
 STALE_FAIL_REASON = '处理超时：后台处理被中断（常见于服务重启或部署），请点击重新处理再试。'
 
 
 def fail_stale_processing() -> int:
-    """僵尸处理态自愈：PROCESSING 超过时限仍无结果的纪要直接置为失败。
+    """僵尸处理态自愈：PROCESSING 超过时限仍无结果（updated_at 久未心跳）的纪要直接置为失败。
     流水线线程跑在受理上传请求的 worker 进程里，服务重启 / worker 回收会把线程连带杀掉，
     状态就永远停在处理中、且只有失败态才有「重新处理」入口；在列表 / 详情读取时兜底翻转。"""
     deadline = timezone.now() - timedelta(minutes=STALE_PROCESSING_MINUTES)
