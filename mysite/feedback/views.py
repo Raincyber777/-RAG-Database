@@ -18,6 +18,9 @@ from safety.models import SensitiveAuditLog
 from .models import Feedback
 from .serializers import FeedbackCreateSerializer, FeedbackSerializer
 
+# 单条反馈截图张数上限（与前端 FeedbackPage 一致）：超限直接拒绝，避免超大 multipart
+MAX_FEEDBACK_IMAGES = 6
+
 
 class FeedbackListCreateView(ListCreateAPIView):
     """GET /api/feedback/ —— 我提交的反馈；POST —— 提交新反馈（multipart，截图 images）"""
@@ -31,6 +34,11 @@ class FeedbackListCreateView(ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         # 截图先校验再落库（字段名 images，可多张），避免校验失败留下半成品反馈
         files = request.FILES.getlist('images')
+        if len(files) > MAX_FEEDBACK_IMAGES:
+            return Response(
+                {'detail': f'一次最多上传 {MAX_FEEDBACK_IMAGES} 张截图'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         for file in files:
             validate_image(file)
 
