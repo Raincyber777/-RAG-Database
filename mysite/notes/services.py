@@ -5,20 +5,22 @@
 - image：qwen-vl-plus 识别板书 / PPT 截图
 - doc / ppt：txt / md 直读；pdf（PyMuPDF）、docx（python-docx）、pptx / ppsx（python-pptx）、
   xlsx（openpyxl）、csv 按扩展名分派解析；老版二进制 .ppt / .doc / .xls 在序列化层即拒绝
-- 抽取失败 / LLM 失败：状态置为 failed，接口层不阻塞（全程后台线程）
+- 抽取失败 / LLM 失败：状态置为 failed，接口层不阻塞（流水线由常驻 note_worker 进程领取执行，
+  与 gunicorn 生命周期解耦：部署重启 / worker 回收不再打断生成中的纪要）
 """
 import base64
 import logging
 import mimetypes
 import os
 import re
-import threading
 import time
 import uuid
 from datetime import timedelta
 
 import requests
 from django.conf import settings
+from django.db import close_old_connections
+from django.db.models import F, Q
 from django.utils import timezone
 
 log = logging.getLogger(__name__)
@@ -33,7 +35,7 @@ from notes.models import Note
 ASR_BASE = 'https://dashscope.aliyuncs.com'
 ASR_MODEL = 'paraformer-v2'
 ASR_POLL_INTERVAL = 3      # 秒
-ASR_POLL_MAX = 400         # 最长轮询 20 分钟（一节课录音量级）
+ASR_POLL_MAX = 600         # 最长轮询 30 分钟（一节课录音量级；worker 常驻不再怕部署重启，上限放宽）
 NO_SPEECH_TEXT = ('未在材料中识别到可用的语音内容：请确认音视频里有人声讲解'
                   '（纯音乐 / 纯画面 / 静音材料无法生成纪要），可更换材料后重试。')
 TEXT_MAX = 60000           # 文本材料保留的最大字符数（RAG 入库与转写原文共用）
@@ -496,12 +498,15 @@ def _merge_partials(partials: list[dict]) -> dict:
     }
 
 
-def _summarize_long(content: str, source_label: str) -> dict:
-    """长文 map-reduce：分段抽取 → 合并去重 → 融合精简成最终 schema"""
+def _summarize_long(content: str, source_label: str, note_id: int | None = None) -> dict:
+    """长文 map-reduce：分段抽取 → 合并去重 → 融合精简成最终 schema
+    分段调用可能持续数分钟，逐段心跳保活，避免 worker 误判执行者已死而重复领取"""
     chunks = _split_chunks(content)
     partials = []
     for i, chunk in enumerate(chunks, 1):
         data = _summarize_part(chunk, source_label, i, len(chunks))
+        if note_id is not None:
+            _touch(note_id)
         if data:
             partials.append(data)
     merged = _merge_partials(partials)
@@ -537,13 +542,14 @@ def _summarize_long(content: str, source_label: str) -> dict:
 
 
 def process_note(note_id: int) -> None:
-    """流水线主体（后台线程执行）：抽取 → 生成（长文走分段 map-reduce）→ 入库；失败置为 failed"""
+    """流水线主体（由常驻 note_worker 进程领取执行）：抽取 → 生成（长文走分段 map-reduce）→ 入库；失败置为 failed"""
+    close_old_connections()   # 常驻进程：清掉可能已失效的旧连接
     note = Note.objects.filter(pk=note_id).first()
     if note is None:
         return
     try:
         content, source_label = _extract(note)
-        _touch(note.pk)   # 抽取（含最长 20 分钟的转写轮询）结束：进入生成阶段前打一次点
+        _touch(note.pk)   # 抽取（含最长转写轮询）结束：进入生成阶段前打一次点
         # 上传材料自动审核：命中高置信违规内容直接拒绝生成（课程材料含健康 / 政治等教学内容不算违规，
         # 只有词库高置信违规才拦；政治半命中交由 moderate 内部分类，中性教学材料放行）
         if moderate(f'{note.title}\n{content[:2000]}')['verdict'] == 'block':
@@ -558,7 +564,7 @@ def process_note(note_id: int) -> None:
             log.info('纪要材料违规拦截 note=%s', note_id)
             return
         fields = (_summarize(content, source_label) if len(content) <= SUMMARIZE_DIRECT_MAX
-                  else _summarize_long(content, source_label))
+                  else _summarize_long(content, source_label, note_id=note.pk))
         note.theme = fields['theme'] or note.title
         note.points = fields['points']
         note.definitions = fields['definitions']
@@ -582,25 +588,48 @@ def process_note(note_id: int) -> None:
         note.status = Note.Status.FAILED
         note.fail_reason = str(exc)[:200] or '材料处理异常，请重试或更换材料'
         note.save(update_fields=['status', 'fail_reason', 'updated_at'])
+    finally:
+        close_old_connections()   # 常驻进程：长阶段结束后释放连接，避免下次领取拿到失效连接
 
 
 def start_processing(note: Note) -> None:
-    """置为处理中并启动后台流水线线程（接口立即返回，前端轮询状态）"""
+    """置为处理中并清零尝试计数，等待常驻 note_worker 领取执行（接口立即返回，前端轮询状态）。
+    流水线不在 Web 进程内跑线程：gunicorn 重启 / 部署不再打断生成中的纪要。"""
     note.status = Note.Status.PROCESSING
     note.fail_reason = ''  # 重新处理时清掉上次的失败原因，避免处理中仍显示旧文案
-    note.save(update_fields=['status', 'fail_reason', 'updated_at'])
-    threading.Thread(target=process_note, args=(note.pk,), daemon=True).start()
+    note.attempts = 0      # 手动重新处理 = 用户明确要求再试，重置自动重试预算
+    note.save(update_fields=['status', 'fail_reason', 'attempts', 'updated_at'])
 
 
-STALE_PROCESSING_MINUTES = 30   # 「无进展时长」阈值：流水线有心跳保活，超过即线程已死 / 彻底卡住
-STALE_FAIL_REASON = '处理超时：后台处理被中断（常见于服务重启或部署），请点击重新处理再试。'
+MAX_ATTEMPTS = 3                # 执行者崩溃遗留的处理态自动重试上限；耗尽后只等用户手动重新处理
+CLAIM_STALE_SECONDS = 300       # 心跳停滞阈值：超过视为执行者已死，允许重新领取（流水线最长无心跳段约 2 分钟）
+STALE_PROCESSING_MINUTES = 30   # 读取路径兜底翻转阈值：重试次数已耗尽且久无心跳才翻失败
+STALE_FAIL_REASON = '处理超时：后台多次尝试仍未完成，请点击重新处理再试；若反复出现请更换材料或联系管理员。'
+
+
+def claim_next_note() -> int | None:
+    """原子领取一份待处理纪要，返回其 id（无可领取时返回 None）。
+    两类候选：新入库的（attempts=0，立即领取）；执行者死亡遗留的（attempts 未耗尽且心跳停滞，重新领取）。
+    领取即 attempts+1，用条件更新保证并发 worker 不会重复执行同一份。"""
+    now = timezone.now()
+    stale_deadline = now - timedelta(seconds=CLAIM_STALE_SECONDS)
+    candidate = (Note.objects.filter(status=Note.Status.PROCESSING)
+                 .filter(Q(attempts=0) | Q(attempts__lt=MAX_ATTEMPTS, updated_at__lt=stale_deadline))
+                 .order_by('attempts', 'updated_at')
+                 .only('id', 'attempts')
+                 .first())
+    if candidate is None:
+        return None
+    claimed = Note.objects.filter(
+        pk=candidate.pk, status=Note.Status.PROCESSING, attempts=candidate.attempts,
+    ).update(attempts=F('attempts') + 1, updated_at=now)
+    return candidate.pk if claimed else None
 
 
 def fail_stale_processing() -> int:
-    """僵尸处理态自愈：PROCESSING 超过时限仍无结果（updated_at 久未心跳）的纪要直接置为失败。
-    流水线线程跑在受理上传请求的 worker 进程里，服务重启 / worker 回收会把线程连带杀掉，
-    状态就永远停在处理中、且只有失败态才有「重新处理」入口；在列表 / 详情读取时兜底翻转。"""
+    """读取路径兜底：自动重试次数已耗尽且心跳久未更新的处理态纪要翻成失败（失败态才有「重新处理」入口）。
+    次数未耗尽的由 note_worker 重新领取自动重试，不在读取路径翻失败——避免与自动重试竞争。"""
     deadline = timezone.now() - timedelta(minutes=STALE_PROCESSING_MINUTES)
     return Note.objects.filter(
-        status=Note.Status.PROCESSING, updated_at__lt=deadline,
+        status=Note.Status.PROCESSING, attempts__gte=MAX_ATTEMPTS, updated_at__lt=deadline,
     ).update(status=Note.Status.FAILED, fail_reason=STALE_FAIL_REASON, updated_at=timezone.now())

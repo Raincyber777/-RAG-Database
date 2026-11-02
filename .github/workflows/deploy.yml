@@ -125,15 +125,19 @@ jobs:
             ./venv/bin/python manage.py migrate --noinput
             mkdir -p media
             cp deploy/rag-backend.service /etc/systemd/system/rag-backend.service
+            cp deploy/rag-note-worker.service /etc/systemd/system/rag-note-worker.service
             systemctl daemon-reload
             # enable 幂等（已启用时静默成功，不会重启进程），restart 必须无条件执行——
             # 否则服务已在运行时新代码只落盘不生效（曾因此线上 404 新接口）
             systemctl enable rag-backend.service >/dev/null 2>&1
+            systemctl enable rag-note-worker.service >/dev/null 2>&1
             systemctl restart rag-backend.service
+            systemctl restart rag-note-worker.service
             rm -f /tmp/rag-backend.tar.gz
             systemctl is-active rag-backend.service
+            systemctl is-active rag-note-worker.service
           REMOTE
-          echo "发布完成：/opt/rag-backend（服务 rag-backend.service 已重启）"
+          echo "发布完成：/opt/rag-backend（服务 rag-backend.service / rag-note-worker.service 已重启）"
 
       - name: Clean up key
         if: always()

@@ -1,0 +1,19 @@
+# 纪要流水线常驻 worker systemd 服务
+# CI 每次部署自动覆盖到 /etc/systemd/system/rag-note-worker.service 并重启
+# 流水线从 gunicorn 请求进程的守护线程迁移到独立常驻进程：
+# 部署重启 gunicorn 不再打断生成中的纪要；worker 自身崩溃由 Restart 拉起，
+# 崩溃遗留的处理态纪要由心跳停滞检测自动重新领取（上限 MAX_ATTEMPTS 次）
+[Unit]
+Description=RAG note worker (resident note pipeline runner)
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/rag-backend
+# 数据库密码 / DashScope key / DEBUG 开关等与 rag-backend.service 共用同一 env 文件
+EnvironmentFile=/etc/rag-backend.env
+ExecStart=/opt/rag-backend/venv/bin/python manage.py note_worker
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
