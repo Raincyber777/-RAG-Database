@@ -254,3 +254,19 @@ CSRF_TRUSTED_ORIGINS += [o.strip() for o in os.environ.get('RAG_CSRF_ORIGINS', '
 # 上传上限：课堂材料 / 截图最大 100MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024
+
+# 日志：纪要流水线 worker 的领取 / 阶段 / 异常日志打到 stderr（gunicorn 与 systemd journal 均捕获），
+# 线上排查视频纪要卡在哪一步直接 journalctl -u rag-note-worker 看 notes 行
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'brief': {'format': '{asctime} {levelname} {name} {message}', 'style': '{'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'brief'},
+    },
+    'loggers': {
+        'notes': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+    },
+}

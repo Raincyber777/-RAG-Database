@@ -22,7 +22,7 @@ from mysite.utils import IsAdminRole
 from .models import Note
 from .serializers import NoteCreateSerializer, NoteSerializer
 from .services import (
-    MAX_ATTEMPTS, STALE_FAIL_REASON, STALE_PROCESSING_MINUTES, fail_stale_processing, start_processing,
+    MAX_ATTEMPTS, STALE_PROCESSING_MINUTES, fail_stale_processing, stale_fail_reason, start_processing,
 )
 
 
@@ -67,7 +67,7 @@ class NoteDetailView(APIView):
                 and note.attempts >= MAX_ATTEMPTS
                 and timezone.now() - note.updated_at > timedelta(minutes=STALE_PROCESSING_MINUTES)):
             note.status = Note.Status.FAILED
-            note.fail_reason = STALE_FAIL_REASON
+            note.fail_reason = stale_fail_reason(note.last_phase)
             note.save(update_fields=['status', 'fail_reason', 'updated_at'])
         if note.uploader_id != request.user.pk and not request.user.is_admin_role:
             self.permission_denied(request, message='无权访问该纪要')

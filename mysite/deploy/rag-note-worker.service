@@ -14,6 +14,9 @@ EnvironmentFile=/etc/rag-backend.env
 ExecStart=/opt/rag-backend/venv/bin/python manage.py note_worker
 Restart=always
 RestartSec=3
+# 部署重启先发 SIGTERM：worker 把当前纪要处理完再退出（最长等 30 分钟，与 ASR 轮询上限对齐），
+# 生成中的纪要不再被部署打断；超时才 SIGKILL，遗留处理态由心跳停滞检测自动重试
+TimeoutStopSec=1800
 
 [Install]
 WantedBy=multi-user.target

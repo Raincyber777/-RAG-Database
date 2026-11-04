@@ -54,11 +54,13 @@ def _mmss(milliseconds: int) -> str:
     return f'{total // 60:02d}:{total % 60:02d}'
 
 
-def _touch(note_id: int) -> None:
-    """流水线心跳：只刷新 updated_at。僵尸自愈（fail_stale_processing）按 updated_at 距今判断，
-    在长阶段（转写轮询等）期间打点后，30 分钟阈值就变成「无进展时长」而非总时长，
-    健康但慢的视频纪要不再被误杀成「处理超时」。"""
-    Note.objects.filter(pk=note_id).update(updated_at=timezone.now())
+def _touch(note_id: int, phase: str | None = None) -> None:
+    """流水线心跳：刷新 updated_at（僵尸自愈按「无进展时长」判断），并可记录当前阶段。
+    阶段随心跳落库后，卡死 / 重试耗尽时失败原因能直接带出停在哪一步，线上排查不再盲猜。"""
+    updates = {'updated_at': timezone.now()}
+    if phase:
+        updates['last_phase'] = phase
+    Note.objects.filter(pk=note_id).update(**updates)
 
 
 def _upload_to_oss(file_path: str) -> str:
@@ -95,6 +97,13 @@ class NoSpeechError(RuntimeError):
 
 def _asr_sentences(file_path: str, note: Note | None = None) -> list[tuple[str, str]]:
     """paraformer-v2 文件转写，返回 [(mm:ss, 句子文本)]"""
+    try:
+        size_mb = os.path.getsize(file_path) / 1024 / 1024
+    except OSError:
+        size_mb = -1
+    if note is not None:
+        _touch(note.pk, '上传转写服务')   # 大文件上传是最长的无心跳段，先打阶段点
+    log.info('上传材料到转写服务 note=%s size=%.1fMB', note.pk if note else '?', size_mb)
     oss_url = _upload_to_oss(file_path)
     res = requests.post(
         f'{ASR_BASE}/api/v1/services/audio/asr/transcription',
@@ -123,7 +132,7 @@ def _asr_sentences(file_path: str, note: Note | None = None) -> list[tuple[str, 
     for i in range(ASR_POLL_MAX):
         time.sleep(ASR_POLL_INTERVAL)
         if note is not None and i % 10 == 0:
-            _touch(note.pk)   # 转写最长可轮询 20 分钟：期间心跳保活，防僵尸自愈误杀
+            _touch(note.pk, '等待转写完成')   # 转写最长可轮询 30 分钟：期间心跳保活，防误判执行者已死
         out = requests.get(f'{ASR_BASE}/api/v1/tasks/{task_id}',
                            headers={'Authorization': f'Bearer {settings.DASHSCOPE_API_KEY}'},
                            timeout=30).json().get('output', {})
@@ -506,7 +515,7 @@ def _summarize_long(content: str, source_label: str, note_id: int | None = None)
     for i, chunk in enumerate(chunks, 1):
         data = _summarize_part(chunk, source_label, i, len(chunks))
         if note_id is not None:
-            _touch(note_id)
+            _touch(note_id, f'生成分段 {i}/{len(chunks)}')
         if data:
             partials.append(data)
     merged = _merge_partials(partials)
@@ -549,7 +558,7 @@ def process_note(note_id: int) -> None:
         return
     try:
         content, source_label = _extract(note)
-        _touch(note.pk)   # 抽取（含最长转写轮询）结束：进入生成阶段前打一次点
+        _touch(note.pk, '审核材料')   # 抽取（含最长转写轮询）结束，进入审核 / 生成阶段
         # 上传材料自动审核：命中高置信违规内容直接拒绝生成（课程材料含健康 / 政治等教学内容不算违规，
         # 只有词库高置信违规才拦；政治半命中交由 moderate 内部分类，中性教学材料放行）
         if moderate(f'{note.title}\n{content[:2000]}')['verdict'] == 'block':
@@ -563,6 +572,7 @@ def process_note(note_id: int) -> None:
             )
             log.info('纪要材料违规拦截 note=%s', note_id)
             return
+        _touch(note.pk, '生成纪要')
         fields = (_summarize(content, source_label) if len(content) <= SUMMARIZE_DIRECT_MAX
                   else _summarize_long(content, source_label, note_id=note.pk))
         note.theme = fields['theme'] or note.title
@@ -576,6 +586,7 @@ def process_note(note_id: int) -> None:
         note.status = Note.Status.DONE
         note.fail_reason = ''
         note.save()
+        _touch(note.pk, '向量化入库')
         rag.index_note(note)  # 生成完成即向量化入库，供智能问答检索
     except NoSpeechError as exc:
         # 无可用语音属正常业务失败：原因直接面向用户展示，不打错误日志
@@ -598,17 +609,25 @@ def start_processing(note: Note) -> None:
     note.status = Note.Status.PROCESSING
     note.fail_reason = ''  # 重新处理时清掉上次的失败原因，避免处理中仍显示旧文案
     note.attempts = 0      # 手动重新处理 = 用户明确要求再试，重置自动重试预算
-    note.save(update_fields=['status', 'fail_reason', 'attempts', 'updated_at'])
+    note.last_phase = '排队等待'
+    note.save(update_fields=['status', 'fail_reason', 'attempts', 'last_phase', 'updated_at'])
 
 
 MAX_ATTEMPTS = 3                # 执行者崩溃遗留的处理态自动重试上限；耗尽后只等用户手动重新处理
-CLAIM_STALE_SECONDS = 300       # 心跳停滞阈值：超过视为执行者已死，允许重新领取（流水线最长无心跳段约 2 分钟）
+CLAIM_STALE_SECONDS = 900       # 心跳停滞阈值：超过视为执行者已死，允许重新领取。
+# 必须盖过最长的无心跳段——大文件（几十 MB 视频）在小带宽服务器上传转写服务可达 5 分钟以上，
+# 阈值太小会把「慢」误判成「死」；自动重试只应发生在执行者真的消失时
 STALE_PROCESSING_MINUTES = 30   # 读取路径兜底翻转阈值：重试次数已耗尽且久无心跳才翻失败
-STALE_FAIL_REASON = '处理超时：后台多次尝试仍未完成，请点击重新处理再试；若反复出现请更换材料或联系管理员。'
 
 
-def claim_next_note() -> int | None:
-    """原子领取一份待处理纪要，返回其 id（无可领取时返回 None）。
+def stale_fail_reason(last_phase: str) -> str:
+    """重试耗尽翻失败时的用户可读原因，带出最后停留的流水线阶段"""
+    return (f'处理超时：后台多次尝试仍未完成（最后停留在「{last_phase or "未知"}」阶段），'
+            '请点击重新处理再试；若反复出现请联系管理员。')
+
+
+def claim_next_note() -> tuple[int, int] | None:
+    """原子领取一份待处理纪要，返回 (id, 本次尝试序号)（无可领取时返回 None）。
     两类候选：新入库的（attempts=0，立即领取）；执行者死亡遗留的（attempts 未耗尽且心跳停滞，重新领取）。
     领取即 attempts+1，用条件更新保证并发 worker 不会重复执行同一份。"""
     now = timezone.now()
@@ -622,14 +641,21 @@ def claim_next_note() -> int | None:
         return None
     claimed = Note.objects.filter(
         pk=candidate.pk, status=Note.Status.PROCESSING, attempts=candidate.attempts,
-    ).update(attempts=F('attempts') + 1, updated_at=now)
-    return candidate.pk if claimed else None
+    ).update(attempts=F('attempts') + 1, updated_at=now, last_phase='正在处理')
+    return (candidate.pk, candidate.attempts + 1) if claimed else None
 
 
 def fail_stale_processing() -> int:
     """读取路径兜底：自动重试次数已耗尽且心跳久未更新的处理态纪要翻成失败（失败态才有「重新处理」入口）。
     次数未耗尽的由 note_worker 重新领取自动重试，不在读取路径翻失败——避免与自动重试竞争。"""
     deadline = timezone.now() - timedelta(minutes=STALE_PROCESSING_MINUTES)
-    return Note.objects.filter(
+    stale = Note.objects.filter(
         status=Note.Status.PROCESSING, attempts__gte=MAX_ATTEMPTS, updated_at__lt=deadline,
-    ).update(status=Note.Status.FAILED, fail_reason=STALE_FAIL_REASON, updated_at=timezone.now())
+    ).only('id', 'last_phase')
+    flipped = 0
+    for note in stale:
+        # 带出最后停留的阶段：同一阶段反复停滞，就说明该阶段在当前服务器环境有问题
+        flipped += Note.objects.filter(pk=note.pk, status=Note.Status.PROCESSING).update(
+            status=Note.Status.FAILED, fail_reason=stale_fail_reason(note.last_phase),
+            updated_at=timezone.now())
+    return flipped

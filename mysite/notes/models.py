@@ -21,6 +21,7 @@ class Note(models.Model):
     status = models.CharField('处理状态', max_length=12, choices=Status.choices, default=Status.PROCESSING)
     fail_reason = models.TextField('失败原因', blank=True, default='')  # 面向用户的可读原因，前端失败提示直接展示
     attempts = models.PositiveSmallIntegerField('处理尝试次数', default=0)  # worker 领取即 +1；崩溃遗留的 processing 靠它自动重试并设上限
+    last_phase = models.CharField('最近流水线阶段', max_length=30, blank=True, default='')  # 心跳打点时记录，卡死 / 超时失败时能直接看到停在哪一步
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL, verbose_name='上传者',
         on_delete=models.CASCADE, related_name='notes',
