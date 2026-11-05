@@ -9,10 +9,15 @@
   与 gunicorn 生命周期解耦：部署重启 / worker 回收不再打断生成中的纪要）
 """
 import base64
+import glob
+import hashlib
 import logging
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from datetime import timedelta
@@ -36,13 +41,21 @@ ASR_BASE = 'https://dashscope.aliyuncs.com'
 ASR_MODEL = 'paraformer-v2'
 ASR_POLL_INTERVAL = 3      # 秒
 ASR_POLL_MAX = 600         # 最长轮询 30 分钟（一节课录音量级；worker 常驻不再怕部署重启，上限放宽）
-NO_SPEECH_TEXT = ('未在材料中识别到可用的语音内容：请确认音视频里有人声讲解'
-                  '（纯音乐 / 纯画面 / 静音材料无法生成纪要），可更换材料后重试。')
+NO_SPEECH_TEXT = ('未在材料中识别到可用的语音内容或可读的画面文字：请确认音视频里有人声讲解'
+                  '或清晰的板书 / 幻灯片（纯音乐 / 纯画面 / 静音材料无法生成纪要），可更换材料后重试。')
+KEYFRAME_MAX = 10             # 无人声视频抽帧上限（场景切换优先，退化按间隔采样）
+KEYFRAME_SCENE_THRESHOLD = 0.2   # ffmpeg 场景切换判定阈值：幻灯片 / 板书翻页会被选中
 TEXT_MAX = 60000           # 文本材料保留的最大字符数（RAG 入库与转写原文共用）
 SUMMARIZE_DIRECT_MAX = 15000   # 不超过该长度直接单次总结；超出走分段 map-reduce
 SUMMARIZE_CHUNK = 12000        # map-reduce 每段目标长度（按段落边界切）
 ZIP_INNER_MAX = 20 * 1024 * 1024    # 压缩包内单文件解压上限（对齐图片上限量级）
 ZIP_TOTAL_MAX = 200 * 1024 * 1024   # 压缩包解压后总量上限（防压缩炸弹）
+
+
+def _is_empty_frame_text(text: str) -> bool:
+    """纯色 / 模糊帧上模型给不出转写，会回「图中无可见文字内容」这类元描述——视为无内容帧，
+    否则会拿这句当正文生成一份垃圾纪要"""
+    return len(text) < 6 or bool(re.search(r'无可见文字|没有文字|无文字|无法识别|无法辨认|不含文字|无任何文字', text))
 
 
 class UnsupportedSource(Exception):
@@ -141,8 +154,8 @@ def _asr_sentences(file_path: str, note: Note | None = None) -> list[tuple[str, 
             break
         if status_ == 'FAILED':
             message = out.get('message') or 'ASR task failed'
-            # 无有效语音片段时任务会以 FAILED 落地（实测纯音乐/静音视频），单独识别给友好文案
-            if 'SUCCESS_WITH_NO_VALID_FRAGMENT' in message:
+            # 无有效语音片段（纯音乐/静音）与无音轨文件，任务都以 FAILED 落地：归入无人声，交给上层退化到画面理解
+            if 'SUCCESS_WITH_NO_VALID_FRAGMENT' in message or 'no audio' in message.lower():
                 raise NoSpeechError(NO_SPEECH_TEXT)
             raise RuntimeError(f'转写任务失败：{message}')
     else:
@@ -377,10 +390,98 @@ def _extract(note: Note) -> tuple[str, str]:
         return _extract_path(note, path)
 
 
+def _video_frames_extract(video_path: str, note: Note) -> list[str]:
+    """视频无人声时的画面理解：ffmpeg 抽帧 → qwen-vl 逐帧识别板书 / 幻灯片文字。
+    抽帧两路合并：场景切换优先（板书 / 幻灯片翻页），不足上限按时长自适应间隔均匀补齐
+    （长视频也能覆盖全片）；逐帧去重后识别。返回非空的识别文本（[画面 N] 前缀供引用溯源）。"""
+    if note is not None:
+        _touch(note.pk, '抽取关键帧')
+    if shutil.which('ffmpeg') is None:
+        raise UnsupportedSource('服务器缺少 ffmpeg，无法解析无语音视频的画面内容；请联系管理员安装')
+    with tempfile.TemporaryDirectory(prefix='note-frames-') as tmp:
+        # 注意：输出模板给 ffmpeg（%02d），收集时用通配（glob 不展开 printf 风格模板）。
+        # 输出用 PNG：部分 ffmpeg 版本的 mjpeg 编码器会拒绝 limited-range YUV（Non full-range 报错）
+        def run_ffmpeg(vf: str, stem: str) -> list[str]:
+            subprocess.run(
+                ['ffmpeg', '-y', '-loglevel', 'error', '-i', video_path,
+                 '-vf', vf, '-frames:v', str(KEYFRAME_MAX), os.path.join(tmp, f'{stem}_%02d.png')],
+                check=False, timeout=300, capture_output=True,
+            )
+            return sorted(glob.glob(os.path.join(tmp, f'{stem}_*.png')))
+
+        # 幻灯片 / 板书翻页视频按场景切换抽帧最准；同版式深色幻灯片亮度差小会漏帧
+        scene_frames = run_ffmpeg(f"select='gt(scene,{KEYFRAME_SCENE_THRESHOLD})'", 's')
+        even_frames = []
+        if len(scene_frames) < KEYFRAME_MAX:
+            try:
+                res = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', video_path],
+                    capture_output=True, timeout=60,
+                )
+                duration = float(res.stdout.strip() or 0)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                duration = 0.0
+            if duration > 0:   # 均匀采样补齐：间隔随时长自适应，10 分钟视频 → 每 60s 一帧
+                interval = max(2.0, duration / KEYFRAME_MAX)
+                even_frames = run_ffmpeg(f'fps=1/{interval:g}', 'e')
+        # 两路合并，同画面（如同一页幻灯片被重复采样）按内容去重，场景帧优先保留
+        frames, seen = [], set()
+        for frame in scene_frames + even_frames:
+            digest = hashlib.md5(open(frame, 'rb').read()).hexdigest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            frames.append(frame)
+            if len(frames) >= KEYFRAME_MAX:
+                break
+        if not frames:
+            return []
+        texts = []
+        for i, frame in enumerate(frames, 1):
+            if note is not None:
+                _touch(note.pk, f'识别画面 {i}/{len(frames)}')
+            try:
+                text = _vision_extract(frame).strip()
+            except Exception:
+                # 单帧识别失败（模糊帧 / 纯色帧模型拒答）只跳过该帧，不能带崩整个视频
+                log.warning('关键帧识别失败 note=%s frame=%s', note.pk if note else '?', frame)
+                continue
+            if text and not _is_empty_frame_text(text):
+                texts.append(f'[画面 {i}] {text}')
+        return texts
+
+
+def _has_audio_stream(path: str) -> bool:
+    """ffprobe 探测文件是否含音轨。无音轨的录屏 / 导出幻灯片视频直接走画面理解，
+    省一次注定失败的转写上传（大文件上传在小带宽服务器上要几分钟）。"""
+    if shutil.which('ffprobe') is None:
+        return True   # 无法探测时不拦，交给转写服务侧报错
+    try:
+        res = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=index', '-of', 'csv=p=0', path],
+            capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return bool(res.stdout.strip())
+
+
 def _extract_path(note: Note, path: str) -> tuple[str, str]:
     kind = note.source_type or 'audio'
     if kind in ('audio', 'video'):
-        sentences = _asr_sentences(path, note)
+        sentences = []
+        if kind == 'audio' or _has_audio_stream(path):
+            try:
+                sentences = _asr_sentences(path, note)
+            except NoSpeechError:
+                sentences = []   # 无人声：视频继续走画面理解，音频维持无人声失败文案
+        if not sentences and kind == 'video':
+            # 视频无人声 / 无音轨（纯演示 / 音乐 MV / 静音录屏）：退化为画面理解，从板书 / 幻灯片生成纪要
+            frame_texts = _video_frames_extract(path, note)
+            if frame_texts:
+                return '\n\n'.join(frame_texts), '板书'
+            raise NoSpeechError(NO_SPEECH_TEXT)   # 语音与画面都无可读内容
         if not sentences:
             raise NoSpeechError(NO_SPEECH_TEXT)
         return '\n'.join(f'[{ts}] {text}' for ts, text in sentences), '录音'

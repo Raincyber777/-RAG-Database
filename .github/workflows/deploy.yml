@@ -124,6 +124,8 @@ jobs:
             ./venv/bin/pip install -q ./agent
             ./venv/bin/python manage.py migrate --noinput
             mkdir -p media
+            # 无人声视频抽帧依赖 ffmpeg（幂等：已装则秒过）
+            command -v ffmpeg >/dev/null 2>&1 || { apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg; }
             cp deploy/rag-backend.service /etc/systemd/system/rag-backend.service
             cp deploy/rag-note-worker.service /etc/systemd/system/rag-note-worker.service
             systemctl daemon-reload
