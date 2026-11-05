@@ -372,14 +372,17 @@ _CHAT_RULES = (
 )
 
 
-def _chat_reply(question: str) -> str | None:
+def _chat_reply(question: str, history: list[tuple[str, str]] | None = None) -> str | None:
     """日常对话直答：由轻量模型判定并回复；判定为需要事实依据的问题（或模型不可用）
-    返回 None，交回原检索 / 拒绝链路，守住「没有依据不编造」的底线。"""
-    data = llm.chat_json(
-        [{'role': 'system', 'content': _CHAT_RULES},
-         {'role': 'user', 'content': question}],
-        model=llm.MODEL_LITE, temperature=0.6,
-    )
+    返回 None，交回原检索 / 拒绝链路，守住「没有依据不编造」的底线。
+    history 为本会话最近几轮 (问, 答)，让「来吧」「继续」这类承接式闲聊能接住上文——
+    单看「来吧」只会得到一句泛泛问候，带上文才知道是在回应「讲个笑话」。"""
+    msgs: list[dict] = [{'role': 'system', 'content': _CHAT_RULES}]
+    for q, a in (history or []):
+        msgs.append({'role': 'user', 'content': str(q)[:200]})
+        msgs.append({'role': 'assistant', 'content': str(a)[:300]})
+    msgs.append({'role': 'user', 'content': question})
+    data = llm.chat_json(msgs, model=llm.MODEL_LITE, temperature=0.6)
     if not isinstance(data, dict) or data.get('refuse'):
         return None
     return str(data.get('reply') or '').strip() or None
@@ -391,12 +394,12 @@ def _general_user(question: str, findings: list[dict]) -> str:
             f'\n\n学生问题：{question}')
 
 
-def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
+def answer_general(question: str, history: list[tuple[str, str]] | None = None) -> tuple[str, list[dict], list[str]] | None:
     """通用问答（无纪要目标）：联网检索 → 清洗 → flash 生成外部知识回答（JSON：answer + followups）。
-    日常对话（寒暄 / 问身份等）不经检索直接回复；返回 (answer, refs, followups)；
-    外部检索不可用 / 无可靠依据返回 None，由调用方用固定话术兜底。"""
+    日常对话（寒暄 / 问身份等）不经检索直接回复；history 为本会话最近几轮，供承接式闲聊接住上下文；
+    返回 (answer, refs, followups)；外部检索不可用 / 无可靠依据返回 None，由调用方用固定话术兜底。"""
     try:
-        reply = _chat_reply(question) if _looks_chitchat(question) else None
+        reply = _chat_reply(question, history) if _looks_chitchat(question) else None
         if reply:
             return reply, [], []
         usage = _usage_reply(question)
@@ -405,7 +408,7 @@ def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
         findings = _pick_findings(question)
         if not findings:
             # 检索一无所获再补一次对话判定：漏网寒暄（「在吗？」）不硬拒
-            reply = _chat_reply(question)
+            reply = _chat_reply(question, history)
             if reply:
                 return reply, [], []
             return None
@@ -433,12 +436,12 @@ def answer_general(question: str) -> tuple[str, list[dict], list[str]] | None:
         return None
 
 
-def answer_stream_general(question: str):
+def answer_stream_general(question: str, history: list[tuple[str, str]] | None = None):
     """通用问答流式版（无纪要目标）：外部检索 → 流式生成，事件与 answer_stream 一致；
-    日常对话不经检索直接回复；外部检索不可用时 yield 固定话术后正常结束
-    （不降级演示检索——通用模式没有纪要可检）。"""
+    日常对话不经检索直接回复（history 供承接式闲聊接住上下文）；外部检索不可用时
+    yield 固定话术后正常结束（不降级演示检索——通用模式没有纪要可检）。"""
     try:
-        reply = _chat_reply(question) if _looks_chitchat(question) else None
+        reply = _chat_reply(question, history) if _looks_chitchat(question) else None
         if reply:
             yield {'type': 'delta', 'text': reply}
             yield {'type': 'end', 'refs': []}
@@ -451,7 +454,7 @@ def answer_stream_general(question: str):
         findings = _pick_findings(question)
         if not findings:
             # 检索一无所获再补一次对话判定：漏网寒暄不硬拒
-            reply = _chat_reply(question)
+            reply = _chat_reply(question, history)
             if not reply:
                 reply = no_general_answer()
             yield {'type': 'delta', 'text': reply}

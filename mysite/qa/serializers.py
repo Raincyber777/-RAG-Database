@@ -41,19 +41,30 @@ class AskSerializer(serializers.Serializer):
     session_ref = serializers.CharField(required=False, allow_blank=True, max_length=64)
 
     images = serializers.ListField(child=serializers.FileField(), required=False, max_length=8, allow_empty=False, write_only=True)
+    documents = serializers.ListField(child=serializers.FileField(), required=False, max_length=8, allow_empty=False, write_only=True)
     image_record_id = serializers.IntegerField(required=False, min_value=1)
 
     def validate(self, data):
         from .images import normalize_image, MAX_TOTAL_BYTES
+        from .documents import MAX_TOTAL_DOC_BYTES
         if data.get('images') and data.get('image_record_id'):
             raise serializers.ValidationError('不能同时上传图片和引用历史图片')
+        if data.get('documents') and (data.get('images') or data.get('image_record_id')):
+            # 视觉链路只认图片、文档链路只读文本，混传会导致其中一类被无视
+            raise serializers.ValidationError('图片和文档请分开提问：一次只上传其中一种附件')
         files = data.get('images', [])
         if sum(f.size for f in files) > MAX_TOTAL_BYTES:
             raise serializers.ValidationError('图片总大小不能超过 40MB')
         if files:
             data['images'] = [normalize_image(file) for file in files]
+        docs = data.get('documents', [])
+        if sum(f.size for f in docs) > MAX_TOTAL_DOC_BYTES:
+            raise serializers.ValidationError('文档总大小不能超过 60MB')
         question = data.get('question', '').strip()
-        if not question and not files and not data.get('image_record_id'):
-            raise serializers.ValidationError({'question': '请输入问题或上传图片'})
-        data['question'] = question or '请描述并分析这些图片中的内容。'
+        if not question and not files and not docs and not data.get('image_record_id'):
+            raise serializers.ValidationError({'question': '请输入问题或上传附件'})
+        if docs:
+            data['question'] = question or '请总结并分析这些文档的主要内容。'
+        else:
+            data['question'] = question or '请描述并分析这些图片中的内容。'
         return data

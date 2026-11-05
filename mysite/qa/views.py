@@ -32,6 +32,7 @@ from .serializers import AskSerializer, QaRecordSerializer
 from . import agent_bridge
 from .sessions import prepare_session, save_answer
 from .images import prepare_images, image_events
+from .documents import extract_doc_text, doc_events
 
 
 def _score(question: str, text: str) -> int:
@@ -151,6 +152,16 @@ def _answer_upload_question(user, question: str) -> tuple[str, list, list] | Non
     return '\n'.join(lines), [], []
 
 
+def _session_history(user, session_ref: str, limit: int = 3) -> list[tuple[str, str]]:
+    """本会话最近几轮 (问, 答)：通用链路回答时带入，承接式闲聊（「来吧」「继续」）
+    才能接住上文——单看这类短句只会得到泛泛问候。当前这轮尚未入库，取到的全是前文。"""
+    if not session_ref:
+        return []
+    prior = list(QaRecord.objects.filter(user=user, session_ref=session_ref)
+                 .order_by('-created_at').values('question', 'answer')[:limit])
+    return [(p['question'], p['answer'][:300]) for p in reversed(prior)]
+
+
 def _rewrite_question(user, session_ref: str, question: str) -> tuple[str, bool]:
     """会话内追问改写：结合本会话最近两轮把「那第二种呢？」改写成独立完整的问题，
     检索与生成都用改写结果；同时判定是否为与学习无关的寒暄闲聊（供引擎路由，
@@ -217,8 +228,8 @@ def _prepare_ask(user, data: dict) -> dict:
     if blocked:
         return {'health_block': blocked, 'question': question, 'rewrite': '',
                 'profile_updated': profile_updated, 'moderate': verdict}
-    if data.get('images') or data.get('image_record_id'):
-        rewrite, chitchat = '', False
+    if data.get('images') or data.get('image_record_id') or data.get('documents'):
+        rewrite, chitchat = '', False  # 附件提问不按闲聊路由，也不做会话改写（问题围绕附件本身）
     else:
         rewrite, chitchat = _rewrite_question(user, data.get('session_ref', ''), question)
     if not chitchat and is_chitchat(question):
@@ -418,6 +429,7 @@ class AskView(APIView):
             # 回答走全局纪要感知 + 联网通用链路，记录也不计入任何纪要的追问角标
             note = None
         images = prepare_images(data, session, request.user)
+        docs = [extract_doc_text(f) for f in data.get('documents', [])]
         prep = _prepare_ask(request.user, data)
         if 'reject' in prep:
             return Response({'detail': prep['reject'], 'category': 'blocked'}, status=status.HTTP_400_BAD_REQUEST)
@@ -441,6 +453,18 @@ class AskView(APIView):
                     if event == 'done':
                         response = Response(payload, status=status.HTTP_201_CREATED)
                         response['X-QA-Engine'] = 'vision'
+                        return response
+                    if event == 'error':
+                        return Response(payload, status=status.HTTP_502_BAD_GATEWAY)
+        elif docs:
+            # 文档附件问答：解析文本 → 流式作答（事件流一次性接口取 done/error 帧）
+            with closing(doc_events(session, request.user, note, question, docs,
+                    profile_updated=prep['profile_updated'],
+                    answer_suffix=moderation.MEDICAL_DISCLAIMER if moderation.health_advice_hit(question) else '')) as events:
+                for event, payload in events:
+                    if event == 'done':
+                        response = Response(payload, status=status.HTTP_201_CREATED)
+                        response['X-QA-Engine'] = 'doc'
                         return response
                     if event == 'error':
                         return Response(payload, status=status.HTTP_502_BAD_GATEWAY)
@@ -471,7 +495,9 @@ class AskView(APIView):
                     elif upload_qa is not None:
                         answer, refs, followups = upload_qa
                     else:
-                        result = rag.answer_general(prep['rewrite'] or question)
+                        # 通用问答带本会话最近几轮：承接式闲聊（「来吧」）才接得住上文
+                        hist = _session_history(request.user, data.get('session_ref', ''))
+                        result = rag.answer_general(prep['rewrite'] or question, hist)
                         if result is not None:
                             answer, refs, followups = result
                         else:
@@ -570,6 +596,7 @@ class AskStreamView(APIView):
             # 回答走全局纪要感知 + 联网通用链路，记录也不计入任何纪要的追问角标
             note = None
         images = prepare_images(data, session, request.user)
+        docs = [extract_doc_text(f) for f in data.get('documents', [])]
         user = request.user
         # 引擎路由在 sse() 内 _prepare_ask 之后最终决定（改写步骤会判定寒暄闲聊）；
         # 下面先用零成本正则快判预置，供响应头在流开始前引用
@@ -580,138 +607,177 @@ class AskStreamView(APIView):
         # 流前响应头用预判：元问题/「我上传了…」也要算进 legacy，避免头标 agent 实跑 legacy
         general = (not explicit_note or is_chitchat(question_text)
                    or is_meta_question(question_text) or is_upload_question(question_text))
-        use_agent = not images and not general and agent_bridge.enabled()
+        use_agent = not images and not docs and not general and agent_bridge.enabled()
 
         def sse():
             nonlocal use_agent, general
-            prep = _prepare_ask(user, data)
-            if 'reject' in prep:
-                yield _sse('blocked', {'category': 'blocked', 'message': prep['reject']})
-                return
-            question = prep['question']
-            rag_question = prep['rewrite'] or question
-            general = note is None or bool(prep.get('chitchat')) or is_upload_question(question)
-            use_agent = (not images and explicit_note and not general
-                         and agent_bridge.enabled())
+            # 断流兜底预置：首帧前就断开时，except 里引用这些变量不至于 NameError
+            question = rag_question = ''
             buf, refs = '', []
             extra: dict = {}
             moderation_flag = ''
+            prep: dict = {}
+            try:
+                prep = _prepare_ask(user, data)
+                if 'reject' in prep:
+                    yield _sse('blocked', {'category': 'blocked', 'message': prep['reject']})
+                    return
+                question = prep['question']
+                rag_question = prep['rewrite'] or question
+                general = note is None or bool(prep.get('chitchat')) or is_upload_question(question)
+                use_agent = (not images and not docs and explicit_note and not general
+                             and agent_bridge.enabled())
+                buf, refs = '', []
+                extra = {}
+                moderation_flag = ''
 
-            if 'health_block' in prep:
-                buf = prep['health_block']
-                moderation_flag = 'health_block'
-                yield _sse('delta', {'text': buf})
-            elif prep['moderate'].get('verdict') == 'redirect':
-                buf = prep['moderate']['message']
-                moderation_flag = 'political'
-                _audit(user, 'political', 'redirect', question)
-                yield _sse('delta', {'text': buf})
-            elif images:
-                with closing(image_events(session, user, note, question, images,
-                        profile_updated=prep['profile_updated'],
-                        answer_suffix=moderation.MEDICAL_DISCLAIMER if moderation.health_advice_hit(question) else '')) as events:
-                    for event, payload in events:
-                        yield _sse(event, payload)
-                return
-            elif use_agent:
-                with closing(agent_bridge.stream(user, note, question)) as events:
-                    for event in events:
-                        if event['event'] == 'delta':
-                            buf += event['data'].get('text', '')
-                        elif event['event'] == 'replace':
-                            # 桥接层已吞掉修正轮的中间 replace：这里只会在结束时收到权威全文
-                            buf = event['data'].get('text', '')
-                        elif event['event'] == 'done':
-                            extra = dict(event['data'])
-                            break
-                        yield _sse(event['event'], event['data'])
-                buf = extra.get('answer') or buf or agent_bridge.UNAVAILABLE
-                refs = extra.get('references') or []
-                tail = moderation.MEDICAL_DISCLAIMER
-                if moderation.health_advice_hit(question) and '不构成医疗建议' not in buf:
-                    buf += tail
-                    yield _sse('delta', {'text': tail})
-            else:
-                if general and is_meta_question(question):
-                    # 元问题（问助手自身/产品功能）：固定介绍文案，即时返回不走外检
-                    buf = META_INTRO
+                if 'health_block' in prep:
+                    buf = prep['health_block']
+                    moderation_flag = 'health_block'
                     yield _sse('delta', {'text': buf})
+                elif prep['moderate'].get('verdict') == 'redirect':
+                    buf = prep['moderate']['message']
+                    moderation_flag = 'political'
+                    _audit(user, 'political', 'redirect', question)
+                    yield _sse('delta', {'text': buf})
+                elif images:
+                    with closing(image_events(session, user, note, question, images,
+                            profile_updated=prep['profile_updated'],
+                            answer_suffix=moderation.MEDICAL_DISCLAIMER if moderation.health_advice_hit(question) else '')) as events:
+                        for event, payload in events:
+                            yield _sse(event, payload)
+                    return
+                elif docs:
+                    # 文档附件问答：解析文本 → 流式作答（与图片视觉链路同构）
+                    with closing(doc_events(session, user, note, question, docs,
+                            profile_updated=prep['profile_updated'],
+                            answer_suffix=moderation.MEDICAL_DISCLAIMER if moderation.health_advice_hit(question) else '')) as events:
+                        for event, payload in events:
+                            yield _sse(event, payload)
+                    return
+                elif use_agent:
+                    with closing(agent_bridge.stream(user, note, question)) as events:
+                        for event in events:
+                            if event['event'] == 'delta':
+                                buf += event['data'].get('text', '')
+                            elif event['event'] == 'replace':
+                                # 桥接层已吞掉修正轮的中间 replace：这里只会在结束时收到权威全文
+                                buf = event['data'].get('text', '')
+                            elif event['event'] == 'done':
+                                extra = dict(event['data'])
+                                break
+                            yield _sse(event['event'], event['data'])
+                    buf = extra.get('answer') or buf or agent_bridge.UNAVAILABLE
+                    refs = extra.get('references') or []
+                    tail = moderation.MEDICAL_DISCLAIMER
+                    if moderation.health_advice_hit(question) and '不构成医疗建议' not in buf:
+                        buf += tail
+                        yield _sse('delta', {'text': tail})
                 else:
-                    user_hit = False
-                    if general and not prep.get('chitchat'):
-                        # 自由对话先跨纪要强召回：问起本人纪要的内容即用纪要作答（引用真实标题），
-                        # 未命中交回通用链路——不强行围绕纪要回答
-                        hit_gen = rag.user_notes_stream(user, rag_question)
-                        if hit_gen is not None:
-                            try:
-                                for ev in hit_gen:
-                                    if ev['type'] == 'delta':
-                                        buf += ev['text']
-                                        yield _sse('delta', {'text': ev['text']})
-                                    elif ev['type'] == 'end':
-                                        refs = ev.get('refs') or []
-                                        extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
-                                        break
-                                    else:  # error：已有增量就地收尾，否则交回通用链路
-                                        break
-                            except Exception:
-                                pass
-                            user_hit = bool(buf.strip())
-                    if not user_hit:
-                        upload_qa = _answer_upload_question(user, question) if general else None
-                        if upload_qa is not None:
-                            buf = upload_qa[0]
-                            yield _sse('delta', {'text': buf})
-                        else:
-                            try:
-                                gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
-                                for ev in gen:
-                                    if ev['type'] == 'delta':
-                                        buf += ev['text']
-                                        yield _sse('delta', {'text': ev['text']})
-                                    elif ev['type'] == 'end':
-                                        refs = ev.get('refs') or []
-                                        extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
-                                        break
-                                    else:  # error：已有增量则就地收尾，否则走演示降级
-                                        break
-                            except Exception:
-                                pass  # 流中断：以已生成内容收尾
-                if not buf:
-                    if general:
-                        buf = rag.no_general_answer()
+                    if general and is_meta_question(question):
+                        # 元问题（问助手自身/产品功能）：固定介绍文案，即时返回不走外检
+                        buf = META_INTRO
                         yield _sse('delta', {'text': buf})
                     else:
-                        buf, refs = demo_answer(note, question)
-                        yield _sse('delta', {'text': buf})
-                tail = moderation.MEDICAL_DISCLAIMER
-                if moderation.health_advice_hit(question) and '不构成医疗建议' not in buf:
-                    buf += tail
-                    yield _sse('delta', {'text': tail})
+                        user_hit = False
+                        if general and not prep.get('chitchat'):
+                            # 自由对话先跨纪要强召回：问起本人纪要的内容即用纪要作答（引用真实标题），
+                            # 未命中交回通用链路——不强行围绕纪要回答
+                            hit_gen = rag.user_notes_stream(user, rag_question)
+                            if hit_gen is not None:
+                                try:
+                                    for ev in hit_gen:
+                                        if ev['type'] == 'delta':
+                                            buf += ev['text']
+                                            yield _sse('delta', {'text': ev['text']})
+                                        elif ev['type'] == 'end':
+                                            refs = ev.get('refs') or []
+                                            extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                                            break
+                                        else:  # error：已有增量就地收尾，否则交回通用链路
+                                            break
+                                except Exception:
+                                    pass
+                                user_hit = bool(buf.strip())
+                        if not user_hit:
+                            upload_qa = _answer_upload_question(user, question) if general else None
+                            if upload_qa is not None:
+                                buf = upload_qa[0]
+                                yield _sse('delta', {'text': buf})
+                            else:
+                                try:
+                                    if general:
+                                        # 通用问答带本会话最近几轮：承接式闲聊（「来吧」）才接得住上文
+                                        hist = _session_history(user, data.get('session_ref', ''))
+                                        gen = rag.answer_stream_general(rag_question, hist)
+                                    else:
+                                        gen = rag.answer_stream(note, rag_question)
+                                    for ev in gen:
+                                        if ev['type'] == 'delta':
+                                            buf += ev['text']
+                                            yield _sse('delta', {'text': ev['text']})
+                                        elif ev['type'] == 'end':
+                                            refs = ev.get('refs') or []
+                                            extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                                            break
+                                        else:  # error：已有增量则就地收尾，否则走演示降级
+                                            break
+                                except Exception:
+                                    pass  # 流中断：以已生成内容收尾
+                    if not buf:
+                        if general:
+                            buf = rag.no_general_answer()
+                            yield _sse('delta', {'text': buf})
+                        else:
+                            buf, refs = demo_answer(note, question)
+                            yield _sse('delta', {'text': buf})
+                    tail = moderation.MEDICAL_DISCLAIMER
+                    if moderation.health_advice_hit(question) and '不构成医疗建议' not in buf:
+                        buf += tail
+                        yield _sse('delta', {'text': tail})
 
-            if moderation_flag:
-                followups = []
-            elif extra.get('mode') == 'no_basis':
-                followups = _refusal_followups(note)
-            else:
-                followups = list(extra.get('followups') or []) or _stream_followups(note, question, buf)
-            record = save_answer(session,
-                user=user, note=note, question=question,
-                answer=buf, references=refs, followups=followups,
-                question_rewrite=prep['rewrite'],
-                retrieval=extra.get('retrieval', []),
-                used_external=extra.get('used_external', False),
-                profile_updated=prep['profile_updated'],
-                moderation=moderation_flag,
-            )
-            if extra.get('mode') == 'no_basis':
-                _upsert_gap(record)
-            yield _sse('done', QaRecordSerializer(record).data)
+                if moderation_flag:
+                    followups = []
+                elif extra.get('mode') == 'no_basis':
+                    followups = _refusal_followups(note)
+                else:
+                    followups = list(extra.get('followups') or []) or _stream_followups(note, question, buf)
+                record = save_answer(session,
+                    user=user, note=note, question=question,
+                    answer=buf, references=refs, followups=followups,
+                    question_rewrite=prep['rewrite'],
+                    retrieval=extra.get('retrieval', []),
+                    used_external=extra.get('used_external', False),
+                    profile_updated=prep['profile_updated'],
+                    moderation=moderation_flag,
+                )
+                if extra.get('mode') == 'no_basis':
+                    _upsert_gap(record)
+                yield _sse('done', QaRecordSerializer(record).data)
+            except GeneratorExit:
+                # 客户端中途断开（停止生成 / 刷新 / 关闭页面）：以已生成内容收尾入库，
+                # 回到会话或刷新后仍能看到这部分回答，而不是整条丢失
+                if buf.strip() and question:
+                    try:
+                        record = save_answer(session,
+                            user=user, note=note, question=question,
+                            answer=buf, references=refs, followups=[],
+                            question_rewrite=prep.get('rewrite', ''),
+                            retrieval=extra.get('retrieval', []),
+                            used_external=extra.get('used_external', False),
+                            profile_updated=prep.get('profile_updated', False),
+                            moderation=moderation_flag,
+                        )
+                        if extra.get('mode') == 'no_basis':
+                            _upsert_gap(record)
+                    except Exception:
+                        pass  # 断流收尾入库失败不影响连接关闭
+                raise
 
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')
         resp['Cache-Control'] = 'no-cache'
         resp['X-Accel-Buffering'] = 'no'
-        resp['X-QA-Engine'] = 'vision' if images else ('agent' if use_agent else 'legacy')
+        resp['X-QA-Engine'] = 'vision' if images else ('doc' if docs else ('agent' if use_agent else 'legacy'))
         return resp
 
 
