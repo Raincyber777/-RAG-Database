@@ -14,8 +14,10 @@ import time
 
 from django.core.management.base import BaseCommand
 from django.db import close_old_connections
+from django.utils import timezone
 
 from notes import services
+from notes.models import Note
 
 log = logging.getLogger('notes.worker')
 
@@ -60,7 +62,12 @@ class Command(BaseCommand):
                 services.process_note(note_id)
                 log.info('纪要处理结束 note=%s 耗时%.0fs', note_id, time.monotonic() - started)
             except Exception:
-                # process_note 内部已把可预期异常翻成 FAILED；这里兜底防止 worker 整体退出
+                # process_note 内部已把可预期异常翻成 FAILED；这里兜底防止 worker 整体退出，
+                # 并把仍滞留处理态的纪要强制翻失败——失败处理器自身再崩也不能留下僵尸重试循环
                 log.exception('纪要处理异常 note=%s', note_id)
+                Note.objects.filter(pk=note_id, status=Note.Status.PROCESSING).update(
+                    status=Note.Status.FAILED,
+                    fail_reason='材料处理出现异常，请点击重新处理再试；若反复出现请联系管理员。',
+                    updated_at=timezone.now())
             if once:
                 return

@@ -590,7 +590,9 @@ def process_note(note_id: int) -> None:
         rag.index_note(note)  # 生成完成即向量化入库，供智能问答检索
     except NoSpeechError as exc:
         # 无可用语音属正常业务失败：原因直接面向用户展示，不打错误日志
-        log.info('纪要无有效语音 note=%s (%s)', note_id, note.source.path if note.source else '?')
+        # 注意只能用 source.name（存储对象名）；source.path 在 OSS 存储上会抛 NotImplementedError，
+        # 失败处理器自己崩掉会让纪要滞留处理态反复重试（线上 AIGC 视频卡死就是这个原因）
+        log.info('纪要无有效语音 note=%s (%s)', note_id, note.source.name if note.source else '?')
         note.status = Note.Status.FAILED
         note.fail_reason = str(exc)
         note.save(update_fields=['status', 'fail_reason', 'updated_at'])
