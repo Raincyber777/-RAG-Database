@@ -413,6 +413,10 @@ class AskView(APIView):
         session = prepare_session(request.user, data, note)
         if session.note_id:
             note = _resolve_ask_note(request, session.note_id)
+        elif data.get('note_id') is None:
+            # 自由对话（未选纪要且会话未绑定纪要）：不再锚定「最新纪要」——
+            # 回答走全局纪要感知 + 联网通用链路，记录也不计入任何纪要的追问角标
+            note = None
         images = prepare_images(data, session, request.user)
         prep = _prepare_ask(request.user, data)
         if 'reject' in prep:
@@ -453,19 +457,25 @@ class AskView(APIView):
                 if moderation.health_advice_hit(question) and '不构成医疗建议' not in answer:
                     answer += tail
             elif note is None or prep.get('chitchat') or is_upload_question(question):
-                # 无纪要目标（账号还没有已完成纪要）或寒暄闲聊：通用模式，
-                # 联网检索回答课堂之外的问题（闲聊没有可引用的证据，进 agent 必空转）
-                upload_qa = _answer_upload_question(request.user, question)
-                if is_meta_question(question):
-                    answer, refs, followups = META_INTRO, [], []
-                elif upload_qa is not None:
-                    answer, refs, followups = upload_qa
+                # 通用链路：元问题 → 本人纪要内容命中（跨纪要强召回）→ 上传清单 → 联网检索。
+                # 自由对话也「认识」本人的全部纪要：问起纪要内容时直接作答（引用真实标题），
+                # 问别的不强行围绕纪要；寒暄闲聊跳过检索由轻量模型直答。
+                hit = (rag.answer_user_notes(request.user, prep['rewrite'] or question, collect=collect)
+                       if not prep.get('chitchat') else None)
+                if hit is not None:
+                    answer, refs, followups = hit
                 else:
-                    result = rag.answer_general(prep['rewrite'] or question)
-                    if result is not None:
-                        answer, refs, followups = result
+                    upload_qa = _answer_upload_question(request.user, question)
+                    if is_meta_question(question):
+                        answer, refs, followups = META_INTRO, [], []
+                    elif upload_qa is not None:
+                        answer, refs, followups = upload_qa
                     else:
-                        answer, refs, followups = rag.no_general_answer(), [], []
+                        result = rag.answer_general(prep['rewrite'] or question)
+                        if result is not None:
+                            answer, refs, followups = result
+                        else:
+                            answer, refs, followups = rag.no_general_answer(), [], []
                 answer = _finish_answer(answer, question)
             else:
                 # 真 RAG：向量召回 + LLM 生成（含追问）；key 未配置 / 检索生成失败时降级演示检索
@@ -555,6 +565,10 @@ class AskStreamView(APIView):
         session = prepare_session(request.user, data, note)
         if session.note_id:
             note = _resolve_ask_note(request, session.note_id)
+        elif data.get('note_id') is None:
+            # 自由对话（未选纪要且会话未绑定纪要）：不再锚定「最新纪要」——
+            # 回答走全局纪要感知 + 联网通用链路，记录也不计入任何纪要的追问角标
+            note = None
         images = prepare_images(data, session, request.user)
         user = request.user
         # 引擎路由在 sse() 内 _prepare_ask 之后最终决定（改写步骤会判定寒暄闲聊）；
@@ -623,25 +637,46 @@ class AskStreamView(APIView):
                     buf = META_INTRO
                     yield _sse('delta', {'text': buf})
                 else:
-                    upload_qa = _answer_upload_question(user, question) if general else None
-                    if upload_qa is not None:
-                        buf = upload_qa[0]
-                        yield _sse('delta', {'text': buf})
-                    else:
-                        try:
-                            gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
-                            for ev in gen:
-                                if ev['type'] == 'delta':
-                                    buf += ev['text']
-                                    yield _sse('delta', {'text': ev['text']})
-                                elif ev['type'] == 'end':
-                                    refs = ev.get('refs') or []
-                                    extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
-                                    break
-                                else:  # error：已有增量则就地收尾，否则走演示降级
-                                    break
-                        except Exception:
-                            pass  # 流中断：以已生成内容收尾
+                    user_hit = False
+                    if general and not prep.get('chitchat'):
+                        # 自由对话先跨纪要强召回：问起本人纪要的内容即用纪要作答（引用真实标题），
+                        # 未命中交回通用链路——不强行围绕纪要回答
+                        hit_gen = rag.user_notes_stream(user, rag_question)
+                        if hit_gen is not None:
+                            try:
+                                for ev in hit_gen:
+                                    if ev['type'] == 'delta':
+                                        buf += ev['text']
+                                        yield _sse('delta', {'text': ev['text']})
+                                    elif ev['type'] == 'end':
+                                        refs = ev.get('refs') or []
+                                        extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                                        break
+                                    else:  # error：已有增量就地收尾，否则交回通用链路
+                                        break
+                            except Exception:
+                                pass
+                            user_hit = bool(buf.strip())
+                    if not user_hit:
+                        upload_qa = _answer_upload_question(user, question) if general else None
+                        if upload_qa is not None:
+                            buf = upload_qa[0]
+                            yield _sse('delta', {'text': buf})
+                        else:
+                            try:
+                                gen = rag.answer_stream_general(rag_question) if general else rag.answer_stream(note, rag_question)
+                                for ev in gen:
+                                    if ev['type'] == 'delta':
+                                        buf += ev['text']
+                                        yield _sse('delta', {'text': ev['text']})
+                                    elif ev['type'] == 'end':
+                                        refs = ev.get('refs') or []
+                                        extra = {k: ev[k] for k in ('retrieval', 'used_external', 'mode') if k in ev}
+                                        break
+                                    else:  # error：已有增量则就地收尾，否则走演示降级
+                                        break
+                            except Exception:
+                                pass  # 流中断：以已生成内容收尾
                 if not buf:
                     if general:
                         buf = rag.no_general_answer()

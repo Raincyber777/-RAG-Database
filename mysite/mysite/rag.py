@@ -127,6 +127,33 @@ def retrieve(note: Note, question: str, k: int = TOP_K) -> list[NoteChunk] | Non
     return [c for c, _ in top] if top else None
 
 
+def retrieve_user_scored(user, question: str, k: int = TOP_K,
+                         exclude: Note | None = None) -> list[tuple[NoteChunk, float]] | None:
+    """跨纪要召回：在该用户全部已完成纪要的片段中向量检索——自由对话里问起自己纪要的内容也能命中。
+    全库片段量级为几十~几百，Python 余弦毫秒级；与 retrieve() 一样后续可平迁 pgvector。
+    exclude 用于纪要内问答兜底（排除当前纪要，避免重复检索刚未命中的同一批片段）。"""
+    qs = NoteChunk.objects.filter(note__uploader=user, note__status=Note.Status.DONE).select_related('note')
+    if exclude is not None:
+        qs = qs.exclude(note=exclude)
+    chunks = list(qs)
+    if not chunks:
+        return None
+    qvec = llm.embed([question])
+    if qvec is None:
+        return None
+    scored = []
+    for c in chunks:
+        if not c.embedding:
+            continue
+        w = min(max(c.weight if c.weight > 0 else 1.0, WEIGHT_MIN), WEIGHT_MAX)
+        scored.append((c, _cosine(qvec[0], c.embedding) * w))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = [(c, s) for c, s in scored[:k] if s > MIN_SCORE]
+    return top or None
+
+
 def _align_refs(note: Note, top: list[NoteChunk], answer: str) -> list[dict]:
     """引用对齐：只展示答案里真正用 [n] 标注引用的片段——答案没有标注就不出知识库来源，
     避免「回答根本没引用资料、下面却挂着来源卡片」的误导（2026-10-26 用户反馈）；
@@ -142,11 +169,29 @@ def _align_refs(note: Note, top: list[NoteChunk], answer: str) -> list[dict]:
     return refs
 
 
+def _align_refs_multi(top: list[NoteChunk], answer: str) -> list[dict]:
+    """跨纪要引用对齐：与 _align_refs 同口径（只认答案真正 [n] 标注的片段），
+    但 label 取片段所属纪要的标题——一次回答可同时引用多份纪要。"""
+    cited = sorted({int(m) for m in re.findall(r'\[\s*(\d{1,2})\s*\]', answer) if 1 <= int(m) <= len(top)})
+    refs: list[dict] = []
+    for n in cited:
+        c = top[n - 1]
+        m = re.search(r'\d{1,2}:\d{2}', c.ref)
+        refs.append({'label': c.note.title, 'time': m.group(0) if m else '',
+                     'detail': c.ref, 'kind': 'kb'})
+    return refs
+
+
 # ---------- 外部知识：融合上下文 / 来源标注 ----------
 
 def _kb_context(top: list[NoteChunk]) -> str:
     """知识库召回片段 → 提示词上下文（带 [编号] 与片段来源 ref）"""
     return '\n'.join(f'[{i + 1}] ({c.ref}) {c.text}' for i, c in enumerate(top))
+
+
+def _user_notes_context(top: list[NoteChunk]) -> str:
+    """跨纪要召回片段 → 提示词上下文：标注片段所属纪要，让引用能溯源到具体课堂"""
+    return '\n'.join(f'[{i + 1}] （《{c.note.title}》· {c.ref}）{c.text}' for i, c in enumerate(top))
 
 
 def _pick_findings(question: str) -> list[dict]:
@@ -442,6 +487,84 @@ def answer_stream_general(question: str):
         yield {'type': 'end', 'refs': refs}
     except Exception:
         yield {'type': 'error'}
+
+
+# ---------- 跨纪要问答：自由对话里问起本人纪要的内容，也能及时作答 ----------
+# 口径：只在强召回（Top1 ≥ KB_STRONG）时接管——用户「问起纪要」才答纪要，
+# 其余问题照旧走联网通用问答，不把助手调成什么都要围绕纪要。
+
+_USER_NOTES_HEADER = '学生本人的课堂纪要检索片段（可能来自不同课堂）：'
+
+
+def answer_user_notes(user, question: str, collect: dict | None = None,
+                      exclude: Note | None = None) -> tuple[str, list[dict], list[str]] | None:
+    """跨纪要问答（一次性）：在本人全部已完成纪要中强召回时依据纪要片段作答，
+    引用带所属纪要标题；未命中 / 无纪要 / 模型不可用返回 None，调用方继续原链路。"""
+    try:
+        scored = retrieve_user_scored(user, question, exclude=exclude)
+        if not scored or scored[0][1] < KB_STRONG:
+            return None
+        top = [c for c, _ in scored]
+        data = llm.chat_json(
+            [{'role': 'system', 'content': _system(_KB_RULES, stream=False)},
+             {'role': 'user', 'content': f'{_USER_NOTES_HEADER}\n{_user_notes_context(top)}\n\n学生问题：{question}'}],
+            temperature=0.3,
+        )
+        if not isinstance(data, dict):
+            return None
+        answer = str(data.get('answer') or '').strip()
+        if not answer:
+            return None
+        raw_followups = data.get('followups')
+        followups = ([str(x).strip() for x in raw_followups if isinstance(x, str) and x.strip()][:3]
+                     if isinstance(raw_followups, list) else [])
+        refs = _align_refs_multi(top, answer)
+        if refs:
+            answer += '\n\n—— 来源说明 ——\n' + _source_line(refs)
+        if collect is not None:
+            collect.update(_collect(scored, False, 'user_kb'))
+        return answer, refs, followups
+    except Exception:
+        return None
+
+
+def user_notes_stream(user, question: str, exclude: Note | None = None):
+    """跨纪要问答（流式）：先同步判定是否强命中本人纪要，命中返回生成器
+    （delta → end 事件，与 answer_stream 一致，end 带检索回执）；未命中返回 None 交回调用方。"""
+    try:
+        scored = retrieve_user_scored(user, question, exclude=exclude)
+    except Exception:
+        return None
+    if not scored or scored[0][1] < KB_STRONG:
+        return None
+    top = [c for c, _ in scored]
+
+    def gen():
+        try:
+            stream = llm.chat_stream(
+                [{'role': 'system', 'content': _system(_KB_RULES, stream=True)},
+                 {'role': 'user', 'content': f'{_USER_NOTES_HEADER}\n{_user_notes_context(top)}\n\n学生问题：{question}'}],
+                temperature=0.3,
+            )
+            if stream is None:
+                yield {'type': 'error'}
+                return
+            buf = ''
+            for delta in stream:
+                buf += delta
+                yield {'type': 'delta', 'text': delta}
+            if not buf.strip():
+                yield {'type': 'error'}
+                return
+            refs = _align_refs_multi(top, buf)
+            if refs:
+                tail = '\n\n—— 来源说明 ——\n' + _source_line(refs)
+                buf += tail
+                yield {'type': 'delta', 'text': tail}
+            yield {'type': 'end', 'refs': refs, **_collect(scored, False, 'user_kb')}
+        except Exception:
+            yield {'type': 'error'}
+    return gen()
 
 
 def _system(rules: str, stream: bool) -> str:
