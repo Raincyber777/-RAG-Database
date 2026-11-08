@@ -436,6 +436,7 @@ class AskView(APIView):
         question = prep['question']
         moderation_flag = ''
         use_agent = False
+        use_code = False
         collect: dict = {}
 
         if 'health_block' in prep:
@@ -468,6 +469,13 @@ class AskView(APIView):
                         return response
                     if event == 'error':
                         return Response(payload, status=status.HTTP_502_BAD_GATEWAY)
+        elif rag.is_code_generation_request(question):
+            # 明确的代码任务不依赖课堂材料或外部搜索结果，即使当前会话选中了纪要也直答。
+            use_code = True
+            history = _session_history(request.user, data.get('session_ref', ''))
+            answer = rag.answer_code_request(question, history) or rag.CODE_GENERATION_UNAVAILABLE
+            refs, followups = [], []
+            answer = _finish_answer(answer, question)
         else:
             # 自由对话（无纪要）与寒暄闲聊固定走 legacy 通用联网检索：agent 的强项在课堂材料问答，
             # 无纪要/无证据可引用时其检索与校验容易空转修正轮次（慢且可能落到轮次上限文案）。
@@ -483,7 +491,6 @@ class AskView(APIView):
             elif note is None or prep.get('chitchat') or is_upload_question(question):
                 # 通用链路：元问题 → 本人纪要内容命中（跨纪要强召回）→ 上传清单 → 联网检索。
                 # 自由对话也「认识」本人的全部纪要：问起纪要内容时直接作答（引用真实标题），
-                # 问别的不强行围绕纪要；寒暄闲聊跳过检索由轻量模型直答。
                 hit = (rag.answer_user_notes(request.user, prep['rewrite'] or question, collect=collect)
                        if not prep.get('chitchat') else None)
                 if hit is not None:
@@ -526,7 +533,7 @@ class AskView(APIView):
         if collect.get('mode') == 'no_basis':
             _upsert_gap(record)
         response = Response(QaRecordSerializer(record).data, status=status.HTTP_201_CREATED)
-        response['X-QA-Engine'] = 'agent' if use_agent else 'legacy'
+        response['X-QA-Engine'] = 'code' if use_code else ('agent' if use_agent else 'legacy')
         return response
 
 
@@ -607,16 +614,18 @@ class AskStreamView(APIView):
         # 流前响应头用预判：元问题/「我上传了…」也要算进 legacy，避免头标 agent 实跑 legacy
         general = (not explicit_note or is_chitchat(question_text)
                    or is_meta_question(question_text) or is_upload_question(question_text))
-        use_agent = not images and not docs and not general and agent_bridge.enabled()
+        code_request = not images and not docs and rag.is_code_generation_request(question_text)
+        use_agent = not images and not docs and not general and not code_request and agent_bridge.enabled()
 
         def sse():
-            nonlocal use_agent, general
+            nonlocal use_agent, general, code_request
             # 断流兜底预置：首帧前就断开时，except 里引用这些变量不至于 NameError
             question = rag_question = ''
             buf, refs = '', []
             extra: dict = {}
             moderation_flag = ''
             prep: dict = {}
+            code_task = False
             try:
                 prep = _prepare_ask(user, data)
                 if 'reject' in prep:
@@ -625,7 +634,9 @@ class AskStreamView(APIView):
                 question = prep['question']
                 rag_question = prep['rewrite'] or question
                 general = note is None or bool(prep.get('chitchat')) or is_upload_question(question)
-                use_agent = (not images and not docs and explicit_note and not general
+                code_task = not images and not docs and rag.is_code_generation_request(question)
+                code_request = code_task
+                use_agent = (not images and not docs and explicit_note and not general and not code_task
                              and agent_bridge.enabled())
                 buf, refs = '', []
                 extra = {}
@@ -655,6 +666,17 @@ class AskStreamView(APIView):
                         for event, payload in events:
                             yield _sse(event, payload)
                     return
+                elif code_task:
+                    history = _session_history(user, data.get('session_ref', ''))
+                    for event in rag.answer_code_stream(question, history):
+                        if event['type'] == 'delta':
+                            buf += event['text']
+                            yield _sse('delta', {'text': event['text']})
+                        elif event['type'] == 'error':
+                            buf = rag.CODE_GENERATION_UNAVAILABLE
+                            yield _sse('replace', {'text': ''})
+                            yield _sse('delta', {'text': buf})
+                            break
                 elif use_agent:
                     with closing(agent_bridge.stream(user, note, question)) as events:
                         for event in events:
@@ -680,7 +702,7 @@ class AskStreamView(APIView):
                         yield _sse('delta', {'text': buf})
                     else:
                         user_hit = False
-                        if general and not prep.get('chitchat'):
+                        if general and not code_task and not prep.get('chitchat'):
                             # 自由对话先跨纪要强召回：问起本人纪要的内容即用纪要作答（引用真实标题），
                             # 未命中交回通用链路——不强行围绕纪要回答
                             hit_gen = rag.user_notes_stream(user, rag_question)
@@ -736,7 +758,7 @@ class AskStreamView(APIView):
                         buf += tail
                         yield _sse('delta', {'text': tail})
 
-                if moderation_flag:
+                if moderation_flag or code_task:
                     followups = []
                 elif extra.get('mode') == 'no_basis':
                     followups = _refusal_followups(note)
@@ -777,7 +799,8 @@ class AskStreamView(APIView):
         resp = StreamingHttpResponse(sse(), content_type='text/event-stream')
         resp['Cache-Control'] = 'no-cache'
         resp['X-Accel-Buffering'] = 'no'
-        resp['X-QA-Engine'] = 'vision' if images else ('doc' if docs else ('agent' if use_agent else 'legacy'))
+        resp['X-QA-Engine'] = ('vision' if images else ('doc' if docs else
+            ('code' if code_request else ('agent' if use_agent else 'legacy'))))
         return resp
 
 

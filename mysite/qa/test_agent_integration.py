@@ -97,7 +97,7 @@ class AgentIntegrationTests(TransactionTestCase):
             api_key='', tavily_api_key='offline-tavily', search_provider='tavily')).start()
 
     def ask(self, stream=False, **extra):
-        return self.client.post('/qa/ask/stream/' if stream else '/qa/ask/',
+        return self.client.post('/api/qa/ask/stream/' if stream else '/api/qa/ask/',
                                 {'note_id': self.note.pk, 'question': '什么是导数？', **extra}, format='json')
 
     def events(self, response):
@@ -302,6 +302,91 @@ class AgentIntegrationTests(TransactionTestCase):
         self.assertEqual(events[-1][0], 'done')
         self.assertIsNone(events[-1][1]['note'])
         self.assertEqual(events[-1][1]['session_ref'], 'qa-general')
+
+    def test_general_code_generation_bypasses_external_search(self):
+        self.note.delete()
+        question = ('编写一个函数 find_max_and_sum(*args)，该函数可以接收任意多个整数作为参数，'
+                    '并返回其中的最大值以及所有整数的总和。请在主程序中调用该函数并打印结果。')
+        answer = 'def find_max_and_sum(*args):\n    return max(args), sum(args)'
+        with patch('mysite.rag.answer_code_request', return_value=answer) as direct, \
+                patch('mysite.rag.answer_general', side_effect=AssertionError('external retrieval path used')):
+            response = self.ask(note_id=None, session_ref='qa-code', question=question)
+        direct.assert_called_once()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['answer'], answer)
+        self.assertEqual(response.data['references'], [])
+        self.assertFalse(response.data['used_external'])
+
+    def test_general_code_generation_stream_bypasses_external_search(self):
+        self.note.delete()
+        question = ('编写一个函数 find_max_and_sum(*args)，该函数可以接收任意多个整数作为参数，'
+                    '并返回其中的最大值以及所有整数的总和。请在主程序中调用该函数并打印结果。')
+        answer = 'def find_max_and_sum(*args):\n    return max(args), sum(args)'
+        events_out = iter([{'type': 'delta', 'text': answer}, {'type': 'end', 'refs': []}])
+        with patch('mysite.rag.answer_code_stream', return_value=events_out) as direct, \
+                patch('mysite.rag.answer_stream_general', side_effect=AssertionError('external retrieval path used')):
+            response = self.ask(stream=True, note_id=None, session_ref='qa-code-stream', question=question)
+            events = self.events(response)
+        direct.assert_called_once()
+        self.assertEqual(events[-1][0], 'done')
+        self.assertEqual(events[-1][1]['answer'], answer)
+        self.assertEqual(events[-1][1]['references'], [])
+
+    def test_selected_note_code_generation_bypasses_classroom_agent(self):
+        question = '编写一个函数 find_max_and_sum(*args)，返回最大值和总和。'
+        answer = 'def find_max_and_sum(*args):\n    return max(args), sum(args)'
+        with patch('mysite.rag.answer_code_request', return_value=answer) as direct:
+            response = self.ask(question=question)
+        direct.assert_called_once()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response['X-QA-Engine'], 'code')
+        self.assertEqual(response.data['answer'], answer)
+        self.assertEqual(len(self.builds), 0)
+        self.embedding.assert_not_called()
+
+    def test_selected_note_code_generation_stream_bypasses_classroom_agent(self):
+        question = '编写一个函数 find_max_and_sum(*args)，返回最大值和总和。'
+        answer = 'def find_max_and_sum(*args):\n    return max(args), sum(args)'
+        events_out = iter([{'type': 'delta', 'text': answer}, {'type': 'end', 'refs': []}])
+        with patch('mysite.rag.answer_code_stream', return_value=events_out) as direct:
+            response = self.ask(stream=True, question=question)
+            events = self.events(response)
+        direct.assert_called_once()
+        self.assertEqual(response['X-QA-Engine'], 'code')
+        self.assertEqual(events[-1][0], 'done')
+        self.assertEqual(events[-1][1]['answer'], answer)
+        self.assertEqual(len(self.builds), 0)
+
+    def test_code_request_detection_requires_an_implementation_request(self):
+        from mysite import rag
+        question = ('编写一个函数 find_max_and_sum(*args)，该函数可以接收任意多个整数作为参数，'
+                    '并返回其中的最大值以及所有整数的总和。请在主程序中调用该函数并打印结果。')
+        self.assertTrue(rag.is_code_generation_request(question))
+        self.assertTrue(rag.is_code_generation_request('Implement a Python function that returns the largest value.'))
+        self.assertFalse(rag.is_code_generation_request('Python 函数为什么可以返回多个值？'))
+
+    def test_code_answer_uses_chat_model_without_search(self):
+        from mysite import rag
+        question = '编写一个函数，返回整数列表的最大值。'
+        with patch('mysite.rag.llm.chat', return_value='```python\nmax(values)\n```') as chat, \
+                patch('mysite.rag._pick_findings', side_effect=AssertionError('search must not run')):
+            answer = rag.answer_code_request(question)
+        self.assertIn('max(values)', answer)
+        kwargs = chat.call_args.kwargs
+        self.assertEqual(kwargs['model'], rag.llm.MODEL_CHAT)
+        messages = chat.call_args.args[0]
+        self.assertIn('不要要求联网资料', messages[0]['content'])
+        self.assertEqual(messages[-1]['content'], question)
+
+    def test_code_answer_stream_emits_content_without_search(self):
+        from mysite import rag
+        with patch('mysite.rag.llm.chat_stream', side_effect=lambda *a, **k: (part for part in ['def f():', '\n    return 1'])) as chat_stream, \
+                patch('mysite.rag._pick_findings', side_effect=AssertionError('search must not run')):
+            events = list(rag.answer_code_stream('写一个返回 1 的 Python 函数。'))
+        self.assertEqual([event['text'] for event in events if event['type'] == 'delta'],
+                         ['def f():', '\n    return 1'])
+        self.assertEqual(events[-1], {'type': 'end', 'refs': []})
+        self.assertEqual(chat_stream.call_args.kwargs['model'], rag.llm.MODEL_CHAT)
 
     @override_settings(DASHSCOPE_API_KEY='')
     def test_agent_model_key_can_come_from_project_env(self):
