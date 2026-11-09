@@ -15,6 +15,7 @@ RAG 检索问答管线：纪要分块 → 向量化入库 → 余弦召回 → �
   调用方（qa.views）回退 demo 检索，保证演示闭环不依赖外网
 """
 import re
+from contextlib import closing
 
 import numpy as np
 
@@ -309,6 +310,62 @@ _GENERAL_RULES = (
     '必须在句末注明「补充自外部知识」，一处都不能漏；'
     '3）外部资料仍不足以回答的部分，明确写「暂时无法确认」，不要编造。'
 )
+
+_CODE_REQUEST_PAT = re.compile(
+    r'(?:编写|写出|写一个|帮我写|帮我实现|实现|生成|补全|完成|编一个).{0,32}'
+    r'(?:代码|程序|函数|方法|脚本|算法|编程题)'
+    r'|(?:write|implement|create|complete).{0,48}\b(?:code|function|method|program|script)\b'
+    r'|\bdef\s+[A-Za-z_]\w*\s*\(',
+    re.I | re.S,
+)
+_CODE_REQUEST_RULES = (
+    '你是编程助教。用户正在请求编写、补全或修改程序，请直接完成任务，不要要求联网资料或来源引用。'
+    '根据题目中的语法推断编程语言；没有线索时先用 Python。给出可运行的完整代码，'
+    '如果用户要求主程序调用或打印结果，就一并给出调用示例和对应输出。'
+    '代码块前可简短说明关键思路；不要声称实际运行或测试过代码。'
+)
+CODE_GENERATION_UNAVAILABLE = '代码生成服务暂不可用，请稍后重试。'
+
+
+def is_code_generation_request(question: str) -> bool:
+    """识别明确的代码编写任务，使其不依赖网页检索是否有结果。"""
+    return bool(_CODE_REQUEST_PAT.search(question or ''))
+
+
+def _code_messages(question: str, history: list[tuple[str, str]] | None = None) -> list[dict]:
+    messages = [{'role': 'system', 'content': _CODE_REQUEST_RULES}]
+    for prior_question, prior_answer in history or []:
+        messages.append({'role': 'user', 'content': str(prior_question)[:500]})
+        messages.append({'role': 'assistant', 'content': str(prior_answer)[:1500]})
+    messages.append({'role': 'user', 'content': question})
+    return messages
+
+
+def answer_code_request(question: str, history: list[tuple[str, str]] | None = None) -> str | None:
+    """直接用主模型处理代码生成，不调用向量或网页检索。"""
+    return llm.chat(_code_messages(question, history), model=llm.MODEL_CHAT, temperature=0.2, timeout=60)
+
+
+def answer_code_stream(question: str, history: list[tuple[str, str]] | None = None):
+    """代码生成流式接口；流异常时保留已生成内容，由调用方决定是否保存。"""
+    stream = llm.chat_stream(_code_messages(question, history), model=llm.MODEL_CHAT,
+                             temperature=0.2, timeout=60)
+    if stream is None:
+        yield {'type': 'error'}
+        return
+    parts = []
+    try:
+        with closing(stream) as tokens:
+            for text in tokens:
+                if text:
+                    parts.append(text)
+                    yield {'type': 'delta', 'text': text}
+        if ''.join(parts).strip():
+            yield {'type': 'end', 'refs': []}
+        else:
+            yield {'type': 'error'}
+    except Exception:
+        yield {'type': 'error'}
 
 
 def no_general_answer() -> str:
