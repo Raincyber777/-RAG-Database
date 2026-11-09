@@ -72,13 +72,49 @@ _HEALTH_ADVICE_PAT = re.compile(
 # ---------- 第 1、2 层：内容审核（违规拦截 / 政治引导） ----------
 
 def moderate(question: str) -> dict:
-    """内容审核门禁（每个提问都会调用，普通问题必须零成本）。
+    """内容审核门禁（每个提问都会调用，不命中词库时零成本）。
     返回 {'verdict': 'allow' | 'redirect' | 'block', 'category': str, 'message': str}。
     block → 直接拦截；redirect → 以 message 作为回答（政治引导）；allow → 正常问答链路。"""
     if _BLOCK_PAT.search(question):
-        return {'verdict': 'block', 'category': 'blocked', 'message': BLOCKED_MESSAGE}
+        return _confirm_block(question)
     if _POLITICAL_PAT.search(question):
         return _classify_political(question)
+    return {'verdict': 'allow', 'category': '', 'message': ''}
+
+
+def _confirm_block(question: str) -> dict:
+    """词库命中后的模型复核。中文没有词边界，「不用去死记硬背」会被违规词「去死」的
+    子串匹配误伤（导游备考材料真事），「景色情感」同理——误拦正常课程内容比漏拦更伤产品，
+    所以正则只做初筛，flash 复核确认确实在传播违规内容才拦。
+    单次复核偶发抖动（同一文本复核 6 次全放行、却在流水线里被判过一次违规），所以
+    用两票不同角度的复核，两票都判违规才拦——真违规两票必然一致，误判很难同时发生。
+    任一票失败按本模块约定 fail-open 放行（宁漏勿错）。"""
+    if not llm.available():
+        return {'verdict': 'allow', 'category': '', 'message': ''}
+    votes = 0
+    for prompt in (
+        '你是学习平台的内容审核员。下面的文本来自课程材料或学生提问，'
+        '词库初筛命中了违规词（暴力 / 毒品 / 色情 / 违法行为教唆 / 辱骂），'
+        '但可能只是包含违规字面的正常用语（如「不用去死记硬背」这类学习方法描述、'
+        '课文引用、学科术语）。请判断文本是否真的在传播或请求上述违规内容：'
+        '真的违规 → block；字面命中但语义正常 → allow。'
+        '只输出 JSON：{"block": true 或 false}',
+        '判断这段学习平台的文本是否真的在传播或请求违规内容'
+        '（暴力 / 毒品 / 色情 / 违法行为教唆 / 辱骂）。注意：文本里仅仅出现违规字眼的'
+        '正常学习用语（如「不用去死记硬背」「景色情感」）不算违规；'
+        '只有真的在传播 / 教唆 / 请求上述内容才算。'
+        '只输出 JSON：{"block": true 或 false}',
+    ):
+        data = llm.chat_json(
+            [{'role': 'system', 'content': prompt},
+             {'role': 'user', 'content': question[:600]}],
+            model=llm.MODEL_LITE, temperature=0.1, timeout=8,
+        )
+        if not (isinstance(data, dict) and data.get('block') is True):
+            return {'verdict': 'allow', 'category': '', 'message': ''}  # 任一票放行即放行
+        votes += 1
+    if votes == 2:
+        return {'verdict': 'block', 'category': 'blocked', 'message': BLOCKED_MESSAGE}
     return {'verdict': 'allow', 'category': '', 'message': ''}
 
 
