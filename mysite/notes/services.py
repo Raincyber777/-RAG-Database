@@ -651,6 +651,12 @@ def _summarize_long(content: str, source_label: str, note_id: int | None = None)
     return merged   # reduce 失败时兜底用合并结果（已去重限量）
 
 
+def _cancelled(note_id: int) -> bool:
+    """停止生成：纪要已被 cancel 接口翻出处理态时，流水线在阶段边界放弃执行、不再落库。
+    用户停止生成后若不取消，串行 worker 会把整轮旧任务跑完，新一轮生成只能干等（表现为卡住很久）。"""
+    return not Note.objects.filter(pk=note_id, status=Note.Status.PROCESSING).exists()
+
+
 def process_note(note_id: int) -> None:
     """流水线主体（由常驻 note_worker 进程领取执行）：抽取 → 生成（长文走分段 map-reduce）→ 入库；失败置为 failed"""
     close_old_connections()   # 常驻进程：清掉可能已失效的旧连接
@@ -659,6 +665,9 @@ def process_note(note_id: int) -> None:
         return
     try:
         content, source_label = _extract(note)
+        if _cancelled(note.pk):
+            log.info('纪要已停止生成，流水线退出（抽取后）note=%s', note_id)
+            return
         _touch(note.pk, '审核材料')   # 抽取（含最长转写轮询）结束，进入审核 / 生成阶段
         # 上传材料自动审核：命中高置信违规内容直接拒绝生成（课程材料含健康 / 政治等教学内容不算违规，
         # 只有词库高置信违规才拦；政治半命中交由 moderate 内部分类，中性教学材料放行）
@@ -673,9 +682,16 @@ def process_note(note_id: int) -> None:
             )
             log.info('纪要材料违规拦截 note=%s', note_id)
             return
+        if _cancelled(note.pk):
+            log.info('纪要已停止生成，流水线退出（审核后，跳过生成）note=%s', note_id)
+            return
         _touch(note.pk, '生成纪要')
         fields = (_summarize(content, source_label) if len(content) <= SUMMARIZE_DIRECT_MAX
                   else _summarize_long(content, source_label, note_id=note.pk))
+        if _cancelled(note.pk):
+            # 生成完成但用户已停止：不保存结果（纪要保持失败态），不让停止的纪要以完成态复活
+            log.info('纪要已停止生成，放弃保存结果 note=%s', note_id)
+            return
         note.theme = fields['theme'] or note.title
         note.points = fields['points']
         note.definitions = fields['definitions']

@@ -9,6 +9,8 @@
 """
 from datetime import timedelta
 
+import logging
+
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
@@ -24,6 +26,8 @@ from .serializers import NoteCreateSerializer, NoteSerializer
 from .services import (
     MAX_ATTEMPTS, STALE_PROCESSING_MINUTES, fail_stale_processing, stale_fail_reason, start_processing,
 )
+
+log = logging.getLogger('notes.views')
 
 
 class NoteListCreateView(ListCreateAPIView):
@@ -94,6 +98,25 @@ class NoteReprocessView(APIView):
         if note.uploader_id != request.user.pk and not request.user.is_admin_role:
             return Response({'detail': '无权操作该纪要'}, status=status.HTTP_403_FORBIDDEN)
         start_processing(note)
+        return Response(NoteSerializer(note).data)
+
+
+class NoteCancelView(APIView):
+    """POST /api/notes/{id}/cancel/ —— 取消仍在处理中的纪要（前端停止生成时调用）。
+    流水线 worker 串行执行：不取消的话，用户中断后重新生成会把整轮新任务排在旧任务后面，
+    表现为长时间卡在处理中。已在执行中的阶段跑完当前阶段即在边界放弃，不再落库。"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        note = get_object_or_404(Note, pk=pk)
+        if note.uploader_id != request.user.pk and not request.user.is_admin_role:
+            return Response({'detail': '无权操作该纪要'}, status=status.HTTP_403_FORBIDDEN)
+        if note.status == Note.Status.PROCESSING:
+            note.status = Note.Status.FAILED
+            note.fail_reason = '已手动停止生成；材料无误可点击重新处理。'
+            note.save(update_fields=['status', 'fail_reason', 'updated_at'])
+            log.info('纪要被用户停止生成 note=%s', note.pk)
         return Response(NoteSerializer(note).data)
 
 
