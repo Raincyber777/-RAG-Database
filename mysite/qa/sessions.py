@@ -58,10 +58,17 @@ def prepare_session(user, data, resolved_note):
         # Compatibility: an older client may supply a previously unseen ref.
         existing = QaSession.objects.filter(ref=ref).first()
         if existing:
-            if existing.user_id != user.pk or existing.deleted:
+            if existing.user_id != user.pk:
                 raise NotFound('对话不存在或无权访问')
             if data.get('note_id') is not None and data['note_id'] != existing.note_id:
                 raise ValidationError('对话与纪要不匹配')
+            if existing.deleted:
+                # 已删除的会话再次提问（典型：课内对话删除后经 ?note= 直达重建）：
+                # 原地复活而不是 404——删除语义是「清空这段对话」，不是「封禁这个入口」
+                existing.deleted = False
+                if existing.note_id is None and data.get('note_id') is not None and resolved_note is not None:
+                    existing.note = resolved_note
+                existing.save(update_fields=['deleted', 'note', 'updated_at'])
             return existing
     session, created = QaSession.objects.get_or_create(ref=ref or str(uuid4()), defaults={
         'user': user, 'note': resolved_note if data.get('note_id') else None,

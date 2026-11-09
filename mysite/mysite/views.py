@@ -44,13 +44,15 @@ def _retrieval_ranked(qs, label_limit: int = 18) -> list[tuple[str, int]]:
 
 
 class StatsSummaryView(APIView):
-    """GET /api/stats/summary/ —— 数据速览"""
+    """GET /api/stats/summary/ —— 数据速览（默认：管理员=平台口径；?scope=personal 强制个人口径）"""
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         user = request.user
-        if user.is_admin_role:
+        # 用户端数据看板展示的是「本人学习数据」，与角色无关：管理员访问自己的看板
+        # 也带 ?scope=personal（不传参维持平台口径，管理端速览不受影响）
+        if user.is_admin_role and request.query_params.get('scope') != 'personal':
             return Response({
                 'scope': 'platform',
                 'users': user.__class__.objects.filter(role='user').count(),
