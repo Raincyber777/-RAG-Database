@@ -301,8 +301,10 @@ class SuggestionsView(APIView):
         else:
             # 还没提过问：优先从本人最新纪要出推荐题；无纪要则全通用
             latest = list(Note.objects.filter(uploader=user, status=Note.Status.DONE).order_by('-created_at')[:2])
-            items = [f'《{n.title}》的重点是什么？' for n in latest] + DEFAULT_SUGGESTIONS[:2] if latest else list(GENERAL_SUGGESTIONS)
-        items = items[:4]
+            items = [f'《{n.title}》的重点是什么？' for n in latest] + DEFAULT_SUGGESTIONS if latest else list(GENERAL_SUGGESTIONS)
+        # 返回候选池（10 条左右）而非固定 4 条：前端每个新对话随机抽 4 展示，
+        # 保证「新开的对话推荐问题不一样、也不都围绕同一个东西」
+        items = items[:10]
         # 缓存到「当天 / 未提新问题」，避免每次进页面都调模型
         latest_pk = QaRecord.objects.filter(user=user).values_list('pk', flat=True).first()
         _SUGGESTION_CACHE[user.pk] = (latest_pk or 0, timezone.localdate().isoformat(), items)
@@ -326,19 +328,32 @@ DEFAULT_SUGGESTIONS = [
     '泰勒展开有哪些易错点？',
     '进程和线程的区别是什么？',
     '二叉树的四种遍历怎么背？',
+    '怎么用费曼学习法复习概念？',
+    '古代汉语的通假字怎么记？',
+    '线性代数的秩有什么几何意义？',
+    '英语长难句怎么拆分主干？',
+    '质能方程 E=mc² 到底什么意思？',
+    '三段论推理常犯哪些逻辑错误？',
 ]
 
-# 无纪要账号（未上传任何课堂资料）的通用推荐：不预设课堂内容，走联网通用问答
+# 无纪要账号（未上传任何课堂资料）的通用推荐：不预设课堂内容，走联网通用问答。
+# 覆盖文/理/艺/生活等多个方向，前端随机抽 4 条，避免每个新对话都推荐同一主题
 GENERAL_SUGGESTIONS = [
     '用通俗的话解释什么是机器学习',
     '帮我制定高数期末复习计划',
     '英语四级作文有哪些万能句型？',
     '什么是毕达哥拉斯定理？',
+    '光合作用和呼吸作用有什么区别？',
+    '中国近代史从哪一年开始算？',
+    '怎么快速背下圆周率前 30 位？',
+    '篮球比赛里的挡拆是什么战术？',
+    '编写简历时最容易被忽略的细节？',
+    '咖啡为什么能让人保持清醒？',
 ]
 
 
 def _rule_suggestions(recent: list[QaRecord]) -> list[str]:
-    """规则版个性化：最近提问的纪要 → 追问定义 / 重点问题 / 复习清单，不足 4 条用兜底补齐。"""
+    """规则版个性化：最近提问的纪要 → 追问定义 / 重点问题 / 复习清单，不足 8 条用兜底补齐。"""
     out: list[str] = []
     notes: list[Note] = []
     for r in recent:
@@ -362,30 +377,31 @@ def _rule_suggestions(recent: list[QaRecord]) -> list[str]:
         out.append(f'把《{notes[0].course}》最近问过的内容串成一份复习清单')
 
     for s in DEFAULT_SUGGESTIONS:
-        if len(out) >= 4:
+        if len(out) >= 8:
             break
         if s not in out:
             out.append(s)
-    return out[:4]
+    return out[:8]
 
 
 def _llm_suggestions(recent: list[QaRecord]) -> list[str] | None:
-    """LLM 个性化追问：把近期提问 + 纪要上下文交给轻量模型，输出 4 条建议；失败返回 None。"""
+    """LLM 个性化追问：把近期提问 + 纪要上下文交给轻量模型，输出 8 条候选建议；失败返回 None。"""
     lines = [f'- 问题：{r.question}（纪要《{r.note.title}》/ {r.note.course}）' for r in recent[:6]]
     prompt = (
-        '你是课堂学习助手。根据学生近期的提问记录，生成 4 条他接下来最可能想问的追问建议。'
-        '要求：中文、口语化、每条不超过 18 字、不要与原问题重复、紧扣下面这些课程内容。\n'
+        '你是课堂学习助手。根据学生近期的提问记录，生成 8 条他接下来最可能想问的追问建议。'
+        '要求：中文、口语化、每条不超过 18 字、不要与原问题重复、紧扣下面这些课程内容，'
+        '且各条之间围绕不同的知识点或角度，不要都围绕同一件事。\n'
         '近期提问：\n' + '\n'.join(lines) +
-        '\n只输出 JSON：{"suggestions": ["...", "...", "...", "..."]}'
+        '\n只输出 JSON：{"suggestions": ["...", "...", "...", "...", "...", "...", "...", "..."]}'
     )
-    data = llm.chat_json([{'role': 'user', 'content': prompt}], model=llm.MODEL_LITE, temperature=0.8)
+    data = llm.chat_json([{'role': 'user', 'content': prompt}], model=llm.MODEL_LITE, temperature=0.9)
     if not isinstance(data, dict):
         return None
     items = data.get('suggestions')
     if not isinstance(items, list):
         return None
     clean = [str(x).strip() for x in items if isinstance(x, str) and 2 <= len(x.strip()) <= 30]
-    return clean[:4] if len(clean) >= 2 else None
+    return clean[:8] if len(clean) >= 2 else None
 
 
 def _resolve_ask_note(request, note_id) -> Note | None:

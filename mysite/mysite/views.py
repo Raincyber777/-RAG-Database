@@ -3,6 +3,7 @@
 - 普通用户：自己的纪要 / 问答 / 练习 / 错题数量 + 数据看板图表聚合（charts）
 - 管理员·超管：平台用户数 / 纪要数 / 问答数 / 待处理反馈数
 """
+import re
 from datetime import timedelta
 
 from django.db.models import Count
@@ -19,10 +20,31 @@ from qa.models import QaRecord
 from quiz.models import QuizItem, WrongRecord
 
 
+_HOT_MD_RE = re.compile(r'\[[^\]]*\]|[#*`>]+|(?<!\d)\d{1,2}[.、)]\s*')
+_HOT_SPLIT_RE = re.compile(r'[。！？；，,、：\n（）()]')
+
+
 def _hot_label(text: str, limit: int) -> str:
-    """片段文本 → 看板热点标签：定义类取「术语：解释」的术语半边，其余截断到 limit 字。"""
-    t = (text or '').strip().split('：')[0].strip()
-    return (t[:limit] or '').strip() or '知识点'
+    """片段文本 → 看板热点标签。剥掉 markdown/画面标记/序号等装饰后，按句读切出
+    「完整短语」再选词——宁可标签更短，也绝不把半句话截在词中间（看板词云要求显示完整）。"""
+    t = re.sub(r'\s+', ' ', _HOT_MD_RE.sub('', text or '')).strip()
+    if not t:
+        return '知识点'
+    head, sep, _rest = t.partition('：')  # 定义类片段：术语半边本身就是完整标签
+    if sep and 1 < len(head.strip()) <= limit:
+        return head.strip()
+    phrases = [p.strip() for p in _HOT_SPLIT_RE.split(t) if p.strip()]
+    fits = [p for p in phrases if 1 < len(p) <= limit]
+    if fits:
+        return fits[0]  # 按原文顺序取第一个放得下的完整短语
+    if not phrases:
+        return '知识点'
+    # 兜底：limit 内没有任何句读的连续长串，只能在标点处收口，实在没有才硬截
+    longest = max(phrases, key=len)
+    for i in range(min(len(longest), limit), 1, -1):
+        if longest[i - 1] in '—·- ':
+            return longest[:i].strip() or '知识点'
+    return longest[:limit].strip() or '知识点'
 
 
 def _retrieval_ranked(qs, label_limit: int = 18) -> list[tuple[str, int]]:
