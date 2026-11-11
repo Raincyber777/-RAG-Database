@@ -26,7 +26,12 @@ AGENT_MAX_MODEL_CALLS = int(os.environ.get('AGENT_MAX_MODEL_CALLS', '8'))
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-%dyq5@_wkpi5lk7(3enmg!dbus&$8ia_4$4zvm2a08!5e$rw8t'
+# 生产部署通过 RAG_DJANGO_SECRET_KEY 注入正式密钥；此回退值仅限本地开发。
+# 注意：该回退值历史上已随仓库公开，公开部署务必设置环境变量并轮换。
+SECRET_KEY = os.environ.get(
+    'RAG_DJANGO_SECRET_KEY',
+    'django-insecure-%dyq5@_wkpi5lk7(3enmg!dbus&$8ia_4$4zvm2a08!5e$rw8t',
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # 服务器部署通过环境变量 DJANGO_DEBUG=False 关闭（见 /etc/rag-backend.env）
