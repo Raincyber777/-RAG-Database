@@ -14,7 +14,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mysite.utils import IsAdminRole, IsSuperRole, StandardPagination
+from mysite.utils import IsAdminRole, IsSuperRole, StandardPagination, ensure_not_demo
 
 from .models import Announcement, AnnouncementRead, LegalDoc
 from .serializers import AnnouncementSerializer
@@ -121,6 +121,7 @@ class AdminAnnouncementDetailView(APIView):
         return Response(AnnouncementSerializer(a).data)
 
     def delete(self, request, pk):
+        ensure_not_demo(request.user)
         get_object_or_404(Announcement, pk=pk).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -130,6 +131,7 @@ class AdminAnnouncementBatchDeleteView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         ids = request.data.get('ids')
         if not isinstance(ids, list) or not ids:
             return Response({'detail': '请选择要删除的公告'}, status=status.HTTP_400_BAD_REQUEST)

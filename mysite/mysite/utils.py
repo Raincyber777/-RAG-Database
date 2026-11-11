@@ -1,7 +1,7 @@
 """
-通用工具：DRF 分页与角色权限类（所有业务 app 共用）
+通用工具：DRF 分页与角色权限类（所有业务 app 共用）+ 评审演示账号闸门
 """
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import BasePermission
 
@@ -32,6 +32,21 @@ class IsSuperRole(BasePermission):
     def has_permission(self, request, view):
         u = request.user
         return bool(u and u.is_authenticated and u.role == 'super')
+
+
+# ---------------- 评审演示账号闸门 ----------------
+DEMO_ACCOUNTS = {'student', 'manager'}
+DEMO_GUARD_MESSAGE = '为保护演示数据，评审演示账号不开放该操作；如需体验完整功能，欢迎注册自己的账号。'
+
+
+def ensure_not_demo(user):
+    """评审演示账号（student / manager）禁止删除类与账号管理类破坏性操作。
+
+    评委使用测试账号体验时保护预置演示数据不被误删（含对真实账号的停用 / 重置密码）；
+    查看、提问、作答、新增内容等其余功能不受影响。teacher 超管不在名单内，便于团队维护。
+    """
+    if getattr(user, 'is_authenticated', False) and getattr(user, 'username', None) in DEMO_ACCOUNTS:
+        raise PermissionDenied(detail=DEMO_GUARD_MESSAGE)
 
 
 def validate_image(file):

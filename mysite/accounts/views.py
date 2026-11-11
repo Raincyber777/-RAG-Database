@@ -15,7 +15,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from mysite.utils import IsAdminRole, IsSuperRole
+from mysite.utils import IsAdminRole, IsSuperRole, ensure_not_demo
 
 from .models import VerificationCode
 from .serializers import (
@@ -275,6 +275,7 @@ class AdminAccountResetPasswordView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request, pk):
+        ensure_not_demo(request.user)
         target = User.objects.filter(pk=pk).first()
         if target is None:
             return Response({'detail': '账号不存在'}, status=status.HTTP_404_NOT_FOUND)
@@ -292,6 +293,7 @@ class AdminAccountBatchResetPasswordView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         ser = ResetPasswordSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         ids = request.data.get('ids')
@@ -315,6 +317,7 @@ class AdminAccountToggleStatusView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request, pk):
+        ensure_not_demo(request.user)
         target = User.objects.filter(pk=pk).first()
         if target is None:
             return Response({'detail': '账号不存在'}, status=status.HTTP_404_NOT_FOUND)

@@ -12,7 +12,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mysite.utils import IsAdminRole, StandardPagination
+from mysite.utils import IsAdminRole, StandardPagination, ensure_not_demo
 
 from .models import Faq, Tip
 from .serializers import FaqSerializer, TipSerializer
@@ -79,6 +79,7 @@ class AdminFaqDetailView(APIView):
         return Response(ser.data)
 
     def delete(self, request, pk):
+        ensure_not_demo(request.user)
         faq = self._get(pk)
         _check_scope_writable(request, faq.scope)
         faq.delete()
@@ -136,6 +137,7 @@ class AdminTipDetailView(APIView):
         return Response(ser.data)
 
     def delete(self, request, pk):
+        ensure_not_demo(request.user)
         tip = self._get(pk)
         _check_scope_writable(request, tip.scope)
         tip.delete()

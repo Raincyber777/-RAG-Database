@@ -21,7 +21,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mysite.utils import IsAdminRole
+from mysite.utils import IsAdminRole, ensure_not_demo
 from mysite import llm, moderation, rag
 from notes.models import Note, NoteChunk
 from safety.masking import mask_contact, mask_health_detail
@@ -866,6 +866,7 @@ class QaRollbackView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         session_ref = str(request.data.get('session_ref') or '').strip()
         try:
             record_id = int(request.data.get('record_id'))
@@ -924,6 +925,7 @@ class AdminQaBatchDeleteView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         ids = request.data.get('ids')
         if not isinstance(ids, list) or not ids:
             return Response({'detail': '请先勾选要删除的记录'}, status=status.HTTP_400_BAD_REQUEST)

@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 
 from mysite import llm
 
-from mysite.utils import IsAdminRole
+from mysite.utils import IsAdminRole, ensure_not_demo
 from notes.models import Note
 
 from .models import QuizItem, WrongRecord
@@ -305,6 +305,7 @@ class WrongDeleteView(APIView):
     permission_classes = [IsAuthenticated]
 
     def delete(self, request, pk):
+        ensure_not_demo(request.user)
         record = WrongRecord.objects.filter(pk=pk, user=request.user).first()
         if record is None:
             return Response({'detail': '记录不存在'}, status=status.HTTP_404_NOT_FOUND)
@@ -339,6 +340,7 @@ class AdminQuizBatchDeleteView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         ids = request.data.get('ids')
         if not isinstance(ids, list) or not ids:
             return Response({'detail': '请先勾选要删除的题目'}, status=status.HTTP_400_BAD_REQUEST)

@@ -19,7 +19,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mysite.utils import IsAdminRole
+from mysite.utils import IsAdminRole, ensure_not_demo
 
 from .models import Note
 from .serializers import NoteCreateSerializer, NoteSerializer
@@ -81,6 +81,7 @@ class NoteDetailView(APIView):
         return Response(NoteSerializer(self._get(request, pk)).data)
 
     def delete(self, request, pk):
+        ensure_not_demo(request.user)
         note = self._get(request, pk)
         if note.source:
             note.source.delete(save=False)
@@ -142,6 +143,7 @@ class CourseDeleteView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         course = (request.data.get('course') or '').strip()
         if not course:
             return Response({'detail': '请提供课程名'}, status=status.HTTP_400_BAD_REQUEST)
@@ -180,6 +182,7 @@ class AdminNoteBatchDeleteView(APIView):
     permission_classes = [IsAuthenticated, IsAdminRole]
 
     def post(self, request):
+        ensure_not_demo(request.user)
         ids = request.data.get('ids')
         if not isinstance(ids, list) or not ids:
             return Response({'detail': '请先勾选要删除的纪要'}, status=status.HTTP_400_BAD_REQUEST)
