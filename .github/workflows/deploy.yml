@@ -6,6 +6,7 @@
 #   Secrets（本仓库专用）：
 #     DASHSCOPE_API_KEY  百炼 API Key（值同本地 mysite/local_settings.py 里的）
 #     RAG_DB_PASSWORD    服务器 PostgreSQL 中 rag_app 账号的密码（首次建库时自定）
+#     DJANGO_SECRET_KEY  Django SECRET_KEY（RAG_DJANGO_SECRET_KEY 注入；不配则回退 settings.py 默认值）
 #     TAVILY_API_KEY     Tavily 联网搜索 key（agent web_search 用；不配则自动回退百炼自带检索）
 #     OSS_BUCKET / OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET
 #                      私有 OSS 桶与 RAM 密钥（三个齐配才启用 OSS 存储，缺任一维持本地存储）
@@ -47,6 +48,7 @@ jobs:
           SSH_PORT: ${{ secrets.DEPLOY_PORT }}
           DASHSCOPE_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           DB_PASSWORD: ${{ secrets.RAG_DB_PASSWORD }}
+          SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
           EMAIL_USER: ${{ secrets.RAG_EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.RAG_EMAIL_PASSWORD }}
           SMS_KEY_ID: ${{ secrets.RAG_SMS_ACCESS_KEY_ID }}
@@ -66,6 +68,9 @@ jobs:
             echo "::error::未配置 secrets DASHSCOPE_API_KEY / RAG_DB_PASSWORD"
             exit 1
           fi
+          # 仅在配置了 DJANGO_SECRET_KEY 时生成注入行（否则空行，回退 settings.py 开发默认值）
+          SK_LINE=""
+          [ -n "$SECRET_KEY" ] && SK_LINE="RAG_DJANGO_SECRET_KEY=$SECRET_KEY"
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
@@ -95,6 +100,8 @@ jobs:
           OSS_CONNECT_TIMEOUT=30
           RAG_DB_USER=rag_app
           RAG_DB_PASSWORD=$DB_PASSWORD
+          # Django SECRET_KEY（配置了 DJANGO_SECRET_KEY secret 才写入；未配置时为空行，回退 settings.py 默认值）
+          $SK_LINE
           DJANGO_DEBUG=False
           RAG_ALLOWED_HOSTS=39.96.61.195,localhost,127.0.0.1
           RAG_CSRF_ORIGINS=http://39.96.61.195:8081,http://39.96.61.195:8082
